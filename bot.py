@@ -20,7 +20,7 @@ from urllib.parse import quote
 import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, Update
+from telegram import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
@@ -54,7 +54,7 @@ BOT_USERNAME = ""
 
 
 _PROTECTED_DISPLAY_RE = re.compile(
-    r"(<code>.*?</code>|<pre>.*?</pre>|https?://[^\s<]+|t\.me/[^\s<]+|@[A-Za-z0-9_]+|/[A-Za-z0-9_]+|<[^>]+>)",
+    r"(<blockquote>.*?</blockquote>|<code>.*?</code>|<pre>.*?</pre>|https?://[^\s<]+|t\.me/[^\s<]+|@[A-Za-z0-9_]+|/[A-Za-z0-9_]+|<[^>]+>)",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -675,7 +675,7 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("👥 Người Dùng"), KeyboardButton("🎯 Nhiệm Vụ")],
-            [KeyboardButton("💰 Quản Lý Xu"), KeyboardButton("🎁 Quà Tặng")],
+            [KeyboardButton("💰 Quản Lý Xu"), KeyboardButton("🛒 Quà Tặng")],
             [KeyboardButton("🔑 Key / File"), KeyboardButton("📊 Thống Kê")],
             [KeyboardButton("📢 Thông Báo"), KeyboardButton("⚙️ Cài Đặt")],
             [KeyboardButton("🛡 Bảo Mật"), KeyboardButton("🔗 Api Rút Gọn")],
@@ -696,7 +696,7 @@ def back_home() -> InlineKeyboardMarkup:
 def admin_main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👥 Người dùng", callback_data="adm:users"), InlineKeyboardButton("🎯 Nhiệm vụ", callback_data="adm:tasks")],
-        [InlineKeyboardButton("💰 Quản lý xu", callback_data="adm:coins"), InlineKeyboardButton("🎁 Quà tặng", callback_data="adm:rewards")],
+        [InlineKeyboardButton("💰 Quản lý xu", callback_data="adm:coins"), InlineKeyboardButton("🛒 Quà tặng", callback_data="adm:rewards")],
         [InlineKeyboardButton("🔑 Key / File", callback_data="adm:keys"), InlineKeyboardButton("📊 Thống kê", callback_data="adm:stats")],
         [InlineKeyboardButton("📢 Thông báo", callback_data="adm:broadcast"), InlineKeyboardButton("⚙️ Cài đặt", callback_data="adm:settings")],
         [InlineKeyboardButton("🛡 Bảo mật", callback_data="adm:security"), InlineKeyboardButton("🔗 API rút gọn", callback_data="adm:shorteners")],
@@ -725,7 +725,7 @@ def home_text(user_id: int) -> str:
         f"🧑‍💼 <b>Admin:</b> {admin}\n"
         "➖ ➖ ➖ ➖ ➖ ➖ ➖ ➖\n"
         f"🏅 <b>Tổng Xu Đã Kiếm:</b> {fmt_xu(earned)}\n"
-        f"🎁 <b>Tổng Xu Đã Đổi:</b> {fmt_xu(spent)}\n"
+        f"🛒 <b>Tổng Xu Đã Đổi:</b> {fmt_xu(spent)}\n"
         f"💰 <b>Số Dư:</b> {fmt_xu(coins)}"
         "</blockquote>"
     )
@@ -901,7 +901,7 @@ def normalize_reward_category(value: str) -> str:
 
 
 def store_category_title(category: str) -> str:
-    return "🔑 Key Hack Game" if category == "key_hack_game" else "🎁 Đổi Quà"
+    return "🔑 Key Hack Game" if category == "key_hack_game" else "🛍️ Store"
 
 
 DEFAULT_STORE_PRODUCTS = [
@@ -999,7 +999,7 @@ async def show_reward_detail(query, uid: int, rid: int):
     stock_text = "∞" if stock < 0 else str(stock)
     back_data = f"store:product:{anchor_back}"
 
-    lines = [f"<b>🎁 {escape(product)}</b>"]
+    lines = [f"<b>🛒 {escape(product)}</b>"]
     if option and option != "Mặc Định":
         lines.append(f"📦 Gói: <b>{escape(option)}</b>")
     lines.extend(["", f"📦 Kho Còn: <b>{stock_text}</b>"])
@@ -1050,7 +1050,7 @@ async def send_store_menu_message(update: Update, uid: int, category: str = "sto
     if not groups:
         lines.append("\nHiện Chưa Có Sản Phẩm Trong Danh Mục Này.")
     for product, anchor in groups:
-        icon = "🔑" if reward_category(anchor) == "key_hack_game" else "🎁"
+        icon = "🔑" if reward_category(anchor) == "key_hack_game" else "🛒"
         buttons.append([
             InlineKeyboardButton(
                 f"{icon} {product}",
@@ -1102,7 +1102,7 @@ async def native_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"🔗 Username: {escape(username)}\n"
             f"💰 Số Dư: <b>{fmt_xu(u['coins'])}</b>\n"
             f"🏅 Đã Kiếm: <b>{fmt_xu(u['total_earned'])}</b>\n"
-            f"🎁 Đã Đổi: <b>{fmt_xu(u['total_spent'])}</b>"
+            f"🛒 Đã Đổi: <b>{fmt_xu(u['total_spent'])}</b>"
         )
         await send_reply(update, msg, parse_mode=ParseMode.HTML, reply_markup=home_keyboard())
         return
@@ -1236,7 +1236,7 @@ ADMIN_NATIVE_ACTIONS = {
     "👥 Người Dùng": "adm:users",
     "🎯 Nhiệm Vụ": "adm:tasks",
     "💰 Quản Lý Xu": "adm:coins",
-    "🎁 Quà Tặng": "adm:rewards",
+    "🛒 Quà Tặng": "adm:rewards",
     "🔑 Key / File": "adm:keys",
     "📊 Thống Kê": "adm:stats",
     "📢 Thông Báo": "adm:broadcast",
@@ -1600,7 +1600,7 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👤 Username: {escape(username)}\n"
             f"💰 Số dư: <b>{fmt_xu(u['coins'])}</b>\n"
             f"🏅 Đã kiếm: <b>{fmt_xu(u['total_earned'])}</b>\n"
-            f"🎁 Đã đổi: <b>{fmt_xu(u['total_spent'])}</b>"
+            f"🛒 Đã đổi: <b>{fmt_xu(u['total_spent'])}</b>"
         )
         await safe_edit(query, text)
         return
@@ -1708,7 +1708,7 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not groups:
             lines.append("\nHiện Chưa Có Sản Phẩm Trong Danh Mục Này.")
         for product, anchor in groups:
-            icon = "🔑" if reward_category(anchor) == "key_hack_game" else "🎁"
+            icon = "🔑" if reward_category(anchor) == "key_hack_game" else "🛒"
             buttons.append([
                 InlineKeyboardButton(
                     f"{icon} {product}",
@@ -1744,7 +1744,7 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Nhiều Gói: Chỉ Hiện Tên Gói, Không Hiện Giá Ở Bước Chọn.
         lines = [
-            f"<b>🎁 {escape(product)}</b>",
+            f"<b>🛒 {escape(product)}</b>",
             "",
             "📦 Chọn Gói / Thời Hạn:",
         ]
@@ -1809,26 +1809,63 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.execute("UPDATE users SET coins=coins-?, total_spent=total_spent+? WHERE user_id=?", (r["price"], r["price"], uid))
             conn.execute("INSERT INTO transactions(user_id,type,amount,note,created_at) VALUES (?,?,?,?,?)", (uid, "redeem", -r["price"], f"Store: {reward_product_name(r)} - {reward_option_label(r)}", now_iso()))
             conn.commit()
+        # Key/Text: Hiện Trực Tiếp Trên Tin Nhắn Xác Nhận, Giữ Nguyên 100% Chữ Hoa/Thường.
+        if delivery_type in ("text", "keypool") and delivery:
+            key_value = str(delivery)
+            kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "📋 Sao Chép Key",
+                        copy_text=CopyTextButton(text=key_value),
+                    )
+                ],
+                [InlineKeyboardButton("⬅️ Trang Chủ", callback_data="home")],
+            ])
+            msg = (
+                "✅ <b>Thanh Toán Thành Công</b>\n"
+                f"🛒 Sản Phẩm : <b>{escape(str(r['name']))}</b>\n\n"
+                f"<blockquote>{escape(key_value)}</blockquote>"
+            )
+            await answer_query(query, "Thanh Toán Thành Công!", show_alert=True)
+            await safe_edit(query, msg, kb)
+            return
+
         if delivery_type == "file_id" and delivery:
             try:
-                await context.bot.send_document(chat_id=uid, document=delivery, caption=display_title_case(f"✅ Quà: {r['name']}"))
+                await context.bot.send_document(
+                    chat_id=uid,
+                    document=delivery,
+                    caption=display_title_case(f"✅ Thanh Toán Thành Công\n🛒 Sản Phẩm : {r['name']}"),
+                )
             except Exception:
-                await send_bot_message(context, chat_id=uid, text="✅ Mua Sản Phẩm Thành Công Nhưng Gửi File Lỗi. Admin Sẽ Kiểm Tra Đơn Của Bạn.")
-        elif delivery_type in ("text", "keypool") and delivery:
-            await send_bot_message(context, chat_id=uid, text=f"✅ {r['name']}\n\n{delivery}")
+                await send_bot_message(
+                    context,
+                    chat_id=uid,
+                    text="✅ Thanh Toán Thành Công Nhưng Gửi File Lỗi. Admin Sẽ Kiểm Tra Đơn Của Bạn.",
+                )
+
         elif delivery_type == "manual":
             admin_id = int(get_setting("admin_id", "0") or 0)
             if admin_id:
                 try:
-                    await send_bot_message(context, admin_id, f"📦 Có đơn thủ công mới #{order_id}\nUser: {uid}\nQuà: {r['name']}\nGiá: {fmt_xu(r['price'])}")
+                    await send_bot_message(
+                        context,
+                        admin_id,
+                        f"📦 Có Đơn Thủ Công Mới #{order_id}\nUser: {uid}\nSản Phẩm: {r['name']}\nGiá: {fmt_xu(r['price'])}",
+                    )
                 except Exception:
                     pass
-        await answer_query(query, "Mua Sản Phẩm Thành Công!", show_alert=True)
-        msg = f"✅ <b>MUA SẢN PHẨM THÀNH CÔNG</b>\n\n🛍️ {escape(reward_product_name(r))} — {escape(reward_option_label(r))}\n💰 Đã Trừ: <b>{fmt_xu(r['price'])}</b>"
+
+        await answer_query(query, "Thanh Toán Thành Công!", show_alert=True)
+        msg = (
+            "✅ <b>Thanh Toán Thành Công</b>\n"
+            f"🛒 Sản Phẩm : <b>{escape(str(r['name']))}</b>\n"
+            f"💰 Đã Trừ: <b>{fmt_xu(r['price'])}</b>"
+        )
         if delivery_type == "manual":
-            msg += f"\n📦 Mã đơn: <code>#{order_id}</code>\nAdmin sẽ xử lý đơn này."
+            msg += f"\n📦 Mã Đơn: <code>#{order_id}</code>\nAdmin Sẽ Xử Lý Đơn Này."
         else:
-            msg += "\n📨 Quà đã được gửi cho bạn."
+            msg += "\n📨 Sản Phẩm Đã Được Gửi Cho Bạn."
         await safe_edit(query, msg, back_home())
         return
 
@@ -1936,7 +1973,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "adm:coins":
         kb=InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Cộng xu", callback_data="adm:ask:addcoins"), InlineKeyboardButton("➖ Trừ xu", callback_data="adm:ask:subcoins")],
-            [InlineKeyboardButton("🎁 Tặng xu toàn bộ", callback_data="adm:ask:giftall")],
+            [InlineKeyboardButton("🛒 Tặng xu toàn bộ", callback_data="adm:ask:giftall")],
             [InlineKeyboardButton("🏆 Top số dư", callback_data="adm:topcoins")],
             [InlineKeyboardButton("⬅️ Admin", callback_data="adm:main")],
         ])
@@ -2090,7 +2127,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
               f"🎯 Nhiệm vụ hôm nay: <b>{fmt_num(claims)}</b>\n"
               f"📈 Nhiệm vụ 7 ngày: <b>{fmt_num(claims7)}</b>\n"
               f"💰 Tổng xu đã phát: <b>{fmt_xu(earned)}</b>\n"
-              f"🎁 Tổng Đơn Hàng: <b>{fmt_num(orders)}</b>\n"
+              f"🛒 Tổng Đơn Hàng: <b>{fmt_num(orders)}</b>\n"
               f"📦 Đơn chờ: <b>{fmt_num(pending)}</b>")
         await safe_edit(query,text,admin_back()); return
 
@@ -2249,7 +2286,7 @@ async def show_admin_user(query, target: int):
     ])
     text=(f"<b>👤 USER {target}</b>\n\n"
           f"Username: @{escape(u['username'] or '-')}\nTên: {escape(u['full_name'] or '-')}\n"
-          f"💰 Số dư: <b>{fmt_xu(u['coins'])}</b>\n🏅 Đã kiếm: <b>{fmt_xu(u['total_earned'])}</b>\n🎁 Đã đổi: <b>{fmt_xu(u['total_spent'])}</b>\n"
+          f"💰 Số dư: <b>{fmt_xu(u['coins'])}</b>\n🏅 Đã kiếm: <b>{fmt_xu(u['total_earned'])}</b>\n🛒 Đã đổi: <b>{fmt_xu(u['total_spent'])}</b>\n"
           f"🎯 Nhiệm vụ đã claim: <b>{claims}</b>\n📦 Đơn: <b>{orders}</b>\nTrạng thái: <b>{status}</b>")
     await safe_edit(query,text,kb)
 
