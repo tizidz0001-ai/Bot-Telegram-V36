@@ -4,6 +4,13 @@ import os
 import re
 import secrets
 import sqlite3
+
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:
+    psycopg = None
+    dict_row = None
 from datetime import datetime, timedelta
 from html import escape
 from pathlib import Path
@@ -33,6 +40,9 @@ ENV_ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@tizimod").strip()
 ENV_CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@yourchannel").strip()
 ENV_SUPPORT_URL = os.getenv("SUPPORT_URL", "https://t.me/tizimod").strip()
 DB_PATH = os.getenv("DB_PATH", "bot.db").strip()
+SUPABASE_DB_URL = (os.getenv("SUPABASE_DB_URL", "") or os.getenv("DATABASE_URL", "")).strip()
+USE_SUPABASE_DB = bool(SUPABASE_DB_URL)
+SUPABASE_DB_SCHEMA = re.sub(r"[^a-zA-Z0-9_]", "_", os.getenv("SUPABASE_DB_SCHEMA", "bot_v36").strip() or "bot_v36")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 TRAFFICVN_API_KEY = os.getenv("TRAFFICVN_API_KEY", "").strip()
 TRAFFICVN_API_URL = os.getenv("TRAFFICVN_API_URL", "https://trafficvn.com/api").strip() or "https://trafficvn.com/api"
@@ -62,7 +72,18 @@ def display_title_case(text: str) -> str:
             output.append(part)
         else:
             output.append(part.title())
-    return "".join(output)
+    result = "".join(output)
+    brand_fixes = {
+        "Migul": "MiGul",
+        "Lv5": "LV5",
+        "Ttx": "TTX",
+        "Buff": "BUFF",
+        "Ios": "iOS",
+        "Api": "API",
+    }
+    for src, dst in brand_fixes.items():
+        result = re.sub(rf"\b{re.escape(src)}\b", dst, result)
+    return result
 
 
 _TELEGRAM_INLINE_KEYBOARD_BUTTON = InlineKeyboardButton
@@ -105,7 +126,100 @@ def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def _pg_translate_sql(sql: str) -> tuple[str, bool]:
+    """Chuyển Cú Pháp SQLite Đang Dùng Sang PostgreSQL/Supabase."""
+    raw = sql.strip()
+    upper = raw.upper()
+    if upper == "BEGIN IMMEDIATE":
+        return "BEGIN", False
+
+    ignore = "INSERT OR IGNORE INTO" in upper
+    if ignore:
+        raw = re.sub(r"INSERT\s+OR\s+IGNORE\s+INTO", "INSERT INTO", raw, flags=re.IGNORECASE)
+
+    raw = raw.replace("?", "%s")
+    raw = re.sub(r"MAX\(0\s*,\s*total_spent\s*-\s*%s\)", "GREATEST(0,total_spent-%s)", raw, flags=re.IGNORECASE)
+
+    if ignore and "ON CONFLICT" not in raw.upper():
+        raw = raw.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+
+    m = re.match(r"\s*INSERT\s+INTO\s+(tasks|rewards|orders|shorteners)\b", raw, flags=re.IGNORECASE)
+    wants_lastrowid = bool(m) and "RETURNING" not in raw.upper() and not ignore
+    if wants_lastrowid:
+        raw = raw.rstrip().rstrip(";") + " RETURNING id"
+    return raw, wants_lastrowid
+
+
+class _CompatCursor:
+    def __init__(self, cursor, lastrowid=None):
+        self._cursor = cursor
+        self.lastrowid = lastrowid
+
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+
+class _PostgresCompatConnection:
+    """Lớp Tương Thích Để Phần Code Cũ Có Thể Dùng Supabase PostgreSQL."""
+    def __init__(self):
+        if psycopg is None:
+            raise RuntimeError(
+                "Thiếu Thư Viện psycopg. Hãy Thêm psycopg[binary]==3.2.9 Vào requirements.txt"
+            )
+        self._conn = psycopg.connect(SUPABASE_DB_URL, row_factory=dict_row)
+        # Dùng Schema Riêng Để Không Xung Đột Với Các Bảng Public Supabase Đã Tạo Trước Đó.
+        self._conn.autocommit = True
+        self._conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{SUPABASE_DB_SCHEMA}"')
+        self._conn.execute(f'SET search_path TO "{SUPABASE_DB_SCHEMA}"')
+        self._conn.autocommit = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is None:
+                self._conn.commit()
+            else:
+                self._conn.rollback()
+        finally:
+            self._conn.close()
+        return False
+
+    def execute(self, sql, params=()):
+        translated, wants_lastrowid = _pg_translate_sql(sql)
+        cur = self._conn.execute(translated, params or ())
+        lastrowid = None
+        if wants_lastrowid:
+            row = cur.fetchone()
+            if row:
+                lastrowid = int(row["id"] if isinstance(row, dict) else row[0])
+        return _CompatCursor(cur, lastrowid)
+
+    def executemany(self, sql, seq_of_params):
+        translated, _ = _pg_translate_sql(sql)
+        cur = self._conn.cursor()
+        cur.executemany(translated, seq_of_params)
+        return _CompatCursor(cur)
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+
 def db_connect():
+    """Ưu Tiên Supabase PostgreSQL. Nếu Chưa Cấu Hình Thì Dùng SQLite Để Test Local."""
+    if USE_SUPABASE_DB:
+        return _PostgresCompatConnection()
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
@@ -121,7 +235,180 @@ def add_column(conn, table: str, definition: str):
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
 
 
+def _init_postgres_db():
+    """Tự Tạo Schema Trên Supabase PostgreSQL Nếu Chưa Có."""
+    with db_connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                total_deposit BIGINT NOT NULL DEFAULT 0,
+                monthly_deposit BIGINT NOT NULL DEFAULT 0,
+                balance BIGINT NOT NULL DEFAULT 0,
+                coins BIGINT NOT NULL DEFAULT 0,
+                total_earned BIGINT NOT NULL DEFAULT 0,
+                total_spent BIGINT NOT NULL DEFAULT 0,
+                banned INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                last_seen TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tasks (
+                id BIGSERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                reward BIGINT NOT NULL,
+                daily_limit INTEGER NOT NULL DEFAULT 1,
+                min_seconds INTEGER NOT NULL DEFAULT 20,
+                shortener_id BIGINT,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS task_sessions (
+                token TEXT PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                task_id BIGINT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                claimed_at TEXT,
+                ip TEXT
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_task ON task_sessions(user_id, task_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_claimed ON task_sessions(claimed_at)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shorteners (
+                id BIGSERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                api_template TEXT NOT NULL,
+                response_key TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rewards (
+                id BIGSERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                product_name TEXT,
+                option_label TEXT NOT NULL DEFAULT 'Mặc Định',
+                category TEXT NOT NULL DEFAULT 'store',
+                description TEXT,
+                price BIGINT NOT NULL,
+                stock INTEGER NOT NULL DEFAULT -1,
+                delivery_type TEXT NOT NULL DEFAULT 'manual',
+                delivery_value TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("ALTER TABLE rewards ADD COLUMN IF NOT EXISTS product_name TEXT")
+        conn.execute("ALTER TABLE rewards ADD COLUMN IF NOT EXISTS option_label TEXT NOT NULL DEFAULT 'Mặc Định'")
+        conn.execute("ALTER TABLE rewards ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'store'")
+        conn.execute("ALTER TABLE rewards ADD COLUMN IF NOT EXISTS description TEXT")
+        conn.execute("UPDATE rewards SET product_name=name WHERE product_name IS NULL OR product_name='' ")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reward_keys (
+                id BIGSERIAL PRIMARY KEY,
+                reward_id BIGINT NOT NULL,
+                value TEXT NOT NULL,
+                used INTEGER NOT NULL DEFAULT 0,
+                user_id BIGINT,
+                used_at TEXT,
+                UNIQUE(reward_id, value)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS orders (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                reward_id BIGINT NOT NULL,
+                reward_name TEXT NOT NULL,
+                price BIGINT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                delivery TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS transactions (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                type TEXT NOT NULL,
+                amount BIGINT NOT NULL DEFAULT 0,
+                note TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id BIGSERIAL PRIMARY KEY,
+                admin_id BIGINT,
+                action TEXT NOT NULL,
+                detail TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+        defaults = {
+            "admin_id": str(ENV_ADMIN_ID or 0),
+            "admin_username": ENV_ADMIN_USERNAME,
+            "channel_username": ENV_CHANNEL_USERNAME,
+            "support_url": ENV_SUPPORT_URL,
+            "guide_text": "1. Chọn 🎯 Làm Nhiệm Vụ.\n2. Vượt Link Đến Trang Xác Nhận.\n3. Quay Lại Bot Và Nhận Xu.\n4. Dùng Xu Trong 🛍️ Store.",
+            "max_claims_per_ip_day": "10",
+            "session_expire_minutes": "60",
+            "allow_direct_task": "0",
+            "maintenance": "0",
+        }
+        for k, v in defaults.items():
+            conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", (k, str(v)))
+
+        ensure_default_store_products(conn)
+
+        if TRAFFICVN_API_KEY:
+            existing_trafficvn = conn.execute(
+                "SELECT id FROM shorteners WHERE lower(name)=lower(?) LIMIT 1",
+                ("TrafficVN",),
+            ).fetchone()
+            if not existing_trafficvn:
+                conn.execute(
+                    "INSERT INTO shorteners(name,api_template,response_key,active,created_at) VALUES (?,?,?,?,?)",
+                    ("TrafficVN", "trafficvn://env", "", 1, now_iso()),
+                )
+        conn.commit()
+
+
 def init_db():
+    if USE_SUPABASE_DB:
+        _init_postgres_db()
+        print("[DB] Đang Dùng Supabase PostgreSQL")
+        return
+
     with db_connect() as conn:
         # Compatible with the old bot database.
         conn.execute(
@@ -177,7 +464,6 @@ def init_db():
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_task ON task_sessions(user_id, task_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_claimed ON task_sessions(claimed_at)")
-
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS shorteners (
@@ -190,7 +476,6 @@ def init_db():
             )
             """
         )
-
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS rewards (
@@ -205,6 +490,14 @@ def init_db():
             )
             """
         )
+        for definition in [
+            "product_name TEXT",
+            "option_label TEXT NOT NULL DEFAULT 'Mặc Định'",
+            "category TEXT NOT NULL DEFAULT 'store'",
+            "description TEXT",
+        ]:
+            add_column(conn, "rewards", definition)
+        conn.execute("UPDATE rewards SET product_name=name WHERE product_name IS NULL OR product_name='' ")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS reward_keys (
@@ -245,14 +538,7 @@ def init_db():
             )
             """
         )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-            """
-        )
+        conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS audit_logs (
@@ -270,7 +556,7 @@ def init_db():
             "admin_username": ENV_ADMIN_USERNAME,
             "channel_username": ENV_CHANNEL_USERNAME,
             "support_url": ENV_SUPPORT_URL,
-            "guide_text": "1. Chọn 🎯 Làm nhiệm vụ.\n2. Vượt link đến trang xác nhận.\n3. Quay lại bot và bấm ✅ Kiểm tra & Nhận xu.\n4. Dùng xu trong 🎁 Đổi quà.",
+            "guide_text": "1. Chọn 🎯 Làm Nhiệm Vụ.\n2. Vượt Link Đến Trang Xác Nhận.\n3. Quay Lại Bot Và Nhận Xu.\n4. Dùng Xu Trong 🛍️ Store.",
             "max_claims_per_ip_day": "10",
             "session_expire_minutes": "60",
             "allow_direct_task": "0",
@@ -279,8 +565,8 @@ def init_db():
         for k, v in defaults.items():
             conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", (k, str(v)))
 
-        # Tự Thêm TrafficVN Khi API Key Được Lưu An Toàn Trong Render Environment.
-        # API Key Không Được Ghi Vào SQLite Hoặc Hiển Thị Trong Telegram.
+        ensure_default_store_products(conn)
+
         if TRAFFICVN_API_KEY:
             existing_trafficvn = conn.execute(
                 "SELECT id FROM shorteners WHERE lower(name)=lower(?) LIMIT 1",
@@ -292,7 +578,6 @@ def init_db():
                     ("TrafficVN", "trafficvn://env", "", 1, now_iso()),
                 )
         conn.commit()
-
 
 def get_setting(key: str, default: str = "") -> str:
     with db_connect() as conn:
@@ -374,9 +659,9 @@ def home_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("👤 Tài Khoản"), KeyboardButton("🎯 Làm Nhiệm Vụ")],
-            [KeyboardButton("🎁 Đổi Quà"), KeyboardButton("📜 Lịch Sử")],
-            [KeyboardButton("🏆 BXH"), KeyboardButton("📖 Hướng Dẫn")],
-            [KeyboardButton("🕺 Hỗ Trợ / Liên Hệ")],
+            [KeyboardButton("🛍️ Store"), KeyboardButton("🔑 Key Hack Game")],
+            [KeyboardButton("📜 Lịch Sử"), KeyboardButton("🏆 BXH")],
+            [KeyboardButton("📖 Hướng Dẫn"), KeyboardButton("🕺 Hỗ Trợ / Liên Hệ")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -394,7 +679,7 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton("🔑 Key / File"), KeyboardButton("📊 Thống Kê")],
             [KeyboardButton("📢 Thông Báo"), KeyboardButton("⚙️ Cài Đặt")],
             [KeyboardButton("🛡 Bảo Mật"), KeyboardButton("🔗 Api Rút Gọn")],
-            [KeyboardButton("📜 Lịch Sử Hệ Thống"), KeyboardButton("📦 Đơn Đổi Quà")],
+            [KeyboardButton("📜 Lịch Sử Hệ Thống"), KeyboardButton("📦 Đơn Hàng")],
             [KeyboardButton("🏠 Menu Người Dùng")],
         ],
         resize_keyboard=True,
@@ -415,7 +700,7 @@ def admin_main_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔑 Key / File", callback_data="adm:keys"), InlineKeyboardButton("📊 Thống kê", callback_data="adm:stats")],
         [InlineKeyboardButton("📢 Thông báo", callback_data="adm:broadcast"), InlineKeyboardButton("⚙️ Cài đặt", callback_data="adm:settings")],
         [InlineKeyboardButton("🛡 Bảo mật", callback_data="adm:security"), InlineKeyboardButton("🔗 API rút gọn", callback_data="adm:shorteners")],
-        [InlineKeyboardButton("📜 Lịch sử hệ thống", callback_data="adm:history"), InlineKeyboardButton("📦 Đơn đổi quà", callback_data="adm:orders")],
+        [InlineKeyboardButton("📜 Lịch sử hệ thống", callback_data="adm:history"), InlineKeyboardButton("📦 Đơn Hàng", callback_data="adm:orders")],
         [InlineKeyboardButton("🏠 Menu người dùng", callback_data="home")],
     ])
 
@@ -463,10 +748,10 @@ def claim_task_session(user_id: int, token: str):
     """Nhận Xu Từ Một Phiên Đã Được Máy Chủ Xác Nhận Hoàn Thành."""
     with db_connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute(
-            "SELECT s.*,t.name,t.reward,t.daily_limit FROM task_sessions s JOIN tasks t ON t.id=s.task_id WHERE s.token=?",
-            (token,),
-        ).fetchone()
+        claim_sql = "SELECT s.*,t.name,t.reward,t.daily_limit FROM task_sessions s JOIN tasks t ON t.id=s.task_id WHERE s.token=?"
+        if USE_SUPABASE_DB:
+            claim_sql += " FOR UPDATE OF s"
+        row = conn.execute(claim_sql, (token,)).fetchone()
         if not row or row["user_id"] != user_id:
             conn.rollback()
             return "invalid", None, None
@@ -577,6 +862,211 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_reply(update, home_text(uid), parse_mode=ParseMode.HTML, reply_markup=home_keyboard())
 
 
+def reward_product_name(row) -> str:
+    try:
+        value = row["product_name"]
+    except Exception:
+        value = None
+    return str(value or row["name"] or "Sản Phẩm").strip()
+
+
+def reward_option_label(row) -> str:
+    try:
+        value = row["option_label"]
+    except Exception:
+        value = None
+    return str(value or "Mặc Định").strip()
+
+
+def reward_category(row) -> str:
+    try:
+        value = row["category"]
+    except Exception:
+        value = None
+    return str(value or "store").strip().lower()
+
+
+def normalize_reward_category(value: str) -> str:
+    raw = (value or "store").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "key": "key_hack_game",
+        "hack": "key_hack_game",
+        "hack_game": "key_hack_game",
+        "key_hack": "key_hack_game",
+        "key_hack_game": "key_hack_game",
+        "store": "store",
+        "all": "store",
+    }
+    return aliases.get(raw, raw or "store")
+
+
+def store_category_title(category: str) -> str:
+    return "🔑 Key Hack Game" if category == "key_hack_game" else "🎁 Đổi Quà"
+
+
+DEFAULT_STORE_PRODUCTS = [
+    "Key MiGul Pro Free",
+    "Clone LV5",
+    "Acc Liên Quân TTX",
+    "BUFF Like Free Fire",
+]
+
+
+def ensure_default_store_products(conn):
+    """Tạo 4 Mục Store Mặc Định. Mục Chưa Có Giá Sẽ Không Thể Mua."""
+    # Đổi Sản Phẩm Cũ "Migul Pro Vn" Thành "Key MiGul Pro Free" Và Giữ Nguyên Giá/Kho/Key.
+    old_rows = conn.execute(
+        "SELECT id,option_label FROM rewards WHERE category=? AND (lower(product_name) LIKE ? OR lower(name) LIKE ?)",
+        ("store", "migul pro vn%", "migul pro vn%"),
+    ).fetchall()
+    for row in old_rows:
+        option = str(row["option_label"] or "Mặc Định")
+        new_name = "Key MiGul Pro Free" if option == "Mặc Định" else f"Key MiGul Pro Free - {option}"
+        conn.execute(
+            "UPDATE rewards SET product_name=?,name=? WHERE id=?",
+            ("Key MiGul Pro Free", new_name, row["id"]),
+        )
+
+    # Các Mục Chưa Có Dữ Liệu Được Tạo Với Giá 0/Kho 0 Để Admin Cấu Hình Sau.
+    for product in DEFAULT_STORE_PRODUCTS:
+        exists = conn.execute(
+            "SELECT id FROM rewards WHERE category=? AND lower(product_name)=lower(?) LIMIT 1",
+            ("store", product),
+        ).fetchone()
+        if not exists:
+            conn.execute(
+                "INSERT INTO rewards(name,product_name,option_label,category,price,stock,delivery_type,delivery_value,active,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (product, product, "Mặc Định", "store", 0, 0, "manual", "", 1, now_iso()),
+            )
+
+
+def load_store_rewards(conn, category: str = "store"):
+    category = normalize_reward_category(category)
+    if category == "key_hack_game":
+        return conn.execute(
+            "SELECT * FROM rewards WHERE active=1 AND category=? ORDER BY product_name,id",
+            ("key_hack_game",),
+        ).fetchall()
+    return conn.execute(
+        "SELECT * FROM rewards WHERE active=1 AND category=? ORDER BY product_name,id",
+        ("store",),
+    ).fetchall()
+
+
+def build_store_groups(rows):
+    groups = []
+    seen = set()
+    for row in rows:
+        key = (reward_category(row), reward_product_name(row).casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        groups.append((reward_product_name(row), row))
+    preferred = {name.casefold(): i for i, name in enumerate(DEFAULT_STORE_PRODUCTS)}
+    groups.sort(key=lambda item: (preferred.get(item[0].casefold(), 9999), item[0].casefold()))
+    return groups
+
+
+def reward_available_stock(conn, reward_row) -> int:
+    if reward_row["delivery_type"] == "keypool":
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM reward_keys WHERE reward_id=? AND used=0",
+            (reward_row["id"],),
+        ).fetchone()
+        return int(row["c"] if row else 0)
+    return int(reward_row["stock"])
+
+
+async def show_reward_detail(query, uid: int, rid: int):
+    with db_connect() as conn:
+        r = conn.execute("SELECT * FROM rewards WHERE id=? AND active=1", (rid,)).fetchone()
+        user = conn.execute("SELECT coins FROM users WHERE user_id=?", (uid,)).fetchone()
+        if not r:
+            await answer_query(query, "Sản Phẩm Không Tồn Tại.", show_alert=True)
+            return
+        stock = reward_available_stock(conn, r)
+        product = reward_product_name(r)
+        category = reward_category(r)
+        option = reward_option_label(r)
+        anchor = conn.execute(
+            "SELECT id FROM rewards WHERE active=1 AND product_name=? AND category=? ORDER BY id LIMIT 1",
+            (product, category),
+        ).fetchone()
+        anchor_back = anchor["id"] if anchor else r["id"]
+
+    balance = int(user["coins"] if user else 0)
+    price = int(r["price"] or 0)
+    stock_text = "∞" if stock < 0 else str(stock)
+    back_data = f"store:product:{anchor_back}"
+
+    lines = [f"<b>🎁 {escape(product)}</b>"]
+    if option and option != "Mặc Định":
+        lines.append(f"📦 Gói: <b>{escape(option)}</b>")
+    lines.extend(["", f"📦 Kho Còn: <b>{stock_text}</b>"])
+
+    buttons = []
+    if price <= 0:
+        lines.extend([
+            "💰 Giá: <b>Chưa Cấu Hình</b>",
+            f"💳 Số Dư Hiện Tại: <b>{fmt_xu(balance)}</b>",
+            "",
+            "⚙️ Sản Phẩm Này Chưa Được Admin Cấu Hình Giá.",
+        ])
+    else:
+        remaining = balance - price
+        lines.extend([
+            f"💰 Giá: <b>{fmt_xu(price)}</b>",
+            f"💳 Số Dư Hiện Tại: <b>{fmt_xu(balance)}</b>",
+        ])
+        if remaining >= 0:
+            lines.append(f"💵 Số Xu Còn Lại Sau Khi Đổi: <b>{fmt_xu(remaining)}</b>")
+        else:
+            lines.append(f"❌ Còn Thiếu: <b>{fmt_xu(abs(remaining))}</b>")
+
+        if stock == 0:
+            lines.extend(["", "❌ Sản Phẩm Đã Hết Hàng."])
+        elif remaining < 0:
+            lines.extend(["", "❌ Bạn Không Đủ Xu Để Đổi Sản Phẩm Này."])
+        else:
+            lines.extend(["", "🔐 Xác Nhận Mua Sản Phẩm?"])
+            buttons.append([InlineKeyboardButton("✅ Xác Nhận Mua", callback_data=f"reward:buy:{rid}")])
+
+    buttons.append([InlineKeyboardButton("❌ Hủy", callback_data=back_data)])
+    await safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(buttons))
+
+
+async def send_store_menu_message(update: Update, uid: int, category: str = "store"):
+    category = normalize_reward_category(category)
+    with db_connect() as conn:
+        rows = load_store_rewards(conn, category)
+        user = conn.execute("SELECT coins FROM users WHERE user_id=?", (uid,)).fetchone()
+    title = store_category_title(category)
+    lines = [
+        f"<b>{title}</b>",
+        f"💰 Số Dư: <b>{fmt_xu(user['coins'] if user else 0)}</b>",
+    ]
+    buttons = []
+    groups = build_store_groups(rows)
+    if not groups:
+        lines.append("\nHiện Chưa Có Sản Phẩm Trong Danh Mục Này.")
+    for product, anchor in groups:
+        icon = "🔑" if reward_category(anchor) == "key_hack_game" else "🎁"
+        buttons.append([
+            InlineKeyboardButton(
+                f"{icon} {product}",
+                callback_data=f"store:product:{anchor['id']}",
+            )
+        ])
+    if category == "key_hack_game":
+        buttons.append([InlineKeyboardButton("🛍️ Xem Toàn Bộ Store", callback_data="store:list:store")])
+    await send_reply(
+        update,
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons) if buttons else home_keyboard(),
+    )
+
+
 async def native_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Xử lý các nút menu cố định của Telegram (Reply Keyboard)."""
     ensure_user(update)
@@ -642,34 +1132,12 @@ async def native_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    if text == "🎁 Đổi Quà":
-        with db_connect() as conn:
-            rewards = conn.execute("SELECT * FROM rewards WHERE active=1 ORDER BY id").fetchall()
-            user = conn.execute("SELECT coins FROM users WHERE user_id=?", (uid,)).fetchone()
-            lines = ["<b>🎁 Đổi Quà</b>", f"💰 Số Dư: <b>{fmt_xu(user['coins'])}</b>", ""]
-            buttons = []
-            if not rewards:
-                lines.append("Hiện Chưa Có Quà.")
-            for r in rewards:
-                if r["delivery_type"] == "keypool":
-                    available = conn.execute(
-                        "SELECT COUNT(*) AS c FROM reward_keys WHERE reward_id=? AND used=0", (r["id"],)
-                    ).fetchone()["c"]
-                    stock_text = str(available)
-                else:
-                    stock_text = "∞" if r["stock"] < 0 else str(r["stock"])
-                lines.append(
-                    f"• <b>{escape(str(r['name']).title())}</b> — {fmt_xu(r['price'])} — Kho {stock_text}"
-                )
-                buttons.append([InlineKeyboardButton(
-                    f"🎁 {str(r['name']).title()} — {fmt_num(r['price'])} Xu",
-                    callback_data=f"reward:view:{r['id']}",
-                )])
-        await send_reply(update, 
-            "\n".join(lines),
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(buttons) if buttons else home_keyboard(),
-        )
+    if text == "🛍️ Store":
+        await send_store_menu_message(update, uid, "store")
+        return
+
+    if text == "🔑 Key Hack Game":
+        await send_store_menu_message(update, uid, "key_hack_game")
         return
 
     if text == "📜 Lịch Sử":
@@ -776,7 +1244,7 @@ ADMIN_NATIVE_ACTIONS = {
     "🛡 Bảo Mật": "adm:security",
     "🔗 Api Rút Gọn": "adm:shorteners",
     "📜 Lịch Sử Hệ Thống": "adm:history",
-    "📦 Đơn Đổi Quà": "adm:orders",
+    "📦 Đơn Hàng": "adm:orders",
 }
 
 
@@ -811,7 +1279,8 @@ async def admin_native_menu_handler(update: Update, context: ContextTypes.DEFAUL
 USER_NATIVE_BUTTONS = {
     "👤 Tài Khoản",
     "🎯 Làm Nhiệm Vụ",
-    "🎁 Đổi Quà",
+    "🛍️ Store",
+    "🔑 Key Hack Game",
     "📜 Lịch Sử",
     "🏆 BXH",
     "📖 Hướng Dẫn",
@@ -1222,43 +1691,80 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if data == "rewards":
+    if data == "rewards" or data.startswith("store:list:"):
+        category = "store"
+        if data.startswith("store:list:"):
+            category = normalize_reward_category(data.split(":", 2)[2])
         with db_connect() as conn:
-            rewards = conn.execute("SELECT * FROM rewards WHERE active=1 ORDER BY id").fetchall()
+            rows = load_store_rewards(conn, category)
             user = conn.execute("SELECT coins FROM users WHERE user_id=?", (uid,)).fetchone()
-            lines = ["<b>🎁 ĐỔI QUÀ</b>", f"💰 Số dư: <b>{fmt_xu(user['coins'])}</b>", ""]
-            buttons = []
-            if not rewards:
-                lines.append("Hiện chưa có quà.")
-            for r in rewards:
-                if r["delivery_type"] == "keypool":
-                    available = conn.execute("SELECT COUNT(*) AS c FROM reward_keys WHERE reward_id=? AND used=0", (r["id"],)).fetchone()["c"]
-                    stock_text = str(available)
-                else:
-                    stock_text = "∞" if r["stock"] < 0 else str(r["stock"])
-                lines.append(f"• <b>{escape(r['name'])}</b> — {fmt_xu(r['price'])} — kho {stock_text}")
-                buttons.append([InlineKeyboardButton(f"🎁 {r['name']} — {fmt_num(r['price'])} Xu", callback_data=f"reward:view:{r['id']}")])
-            buttons.append([InlineKeyboardButton("⬅️ Trang chủ", callback_data="home")])
+        title = store_category_title(category)
+        lines = [
+            f"<b>{title}</b>",
+            f"💰 Số Dư: <b>{fmt_xu(user['coins'] if user else 0)}</b>",
+        ]
+        buttons = []
+        groups = build_store_groups(rows)
+        if not groups:
+            lines.append("\nHiện Chưa Có Sản Phẩm Trong Danh Mục Này.")
+        for product, anchor in groups:
+            icon = "🔑" if reward_category(anchor) == "key_hack_game" else "🎁"
+            buttons.append([
+                InlineKeyboardButton(
+                    f"{icon} {product}",
+                    callback_data=f"store:product:{anchor['id']}",
+                )
+            ])
+        if category == "key_hack_game":
+            buttons.append([InlineKeyboardButton("🛍️ Xem Toàn Bộ Store", callback_data="store:list:store")])
+        buttons.append([InlineKeyboardButton("⬅️ Trang Chủ", callback_data="home")])
+        await safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("store:product:"):
+        anchor_id = int(data.rsplit(":", 1)[1])
+        with db_connect() as conn:
+            anchor = conn.execute("SELECT * FROM rewards WHERE id=? AND active=1", (anchor_id,)).fetchone()
+            if not anchor:
+                await answer_query(query, "Sản Phẩm Không Tồn Tại.", show_alert=True)
+                return
+            product = reward_product_name(anchor)
+            category = reward_category(anchor)
+            variants = conn.execute(
+                "SELECT * FROM rewards WHERE active=1 AND product_name=? AND category=? ORDER BY price,id",
+                (product, category),
+            ).fetchall()
+            if not variants:
+                variants = [anchor]
+
+        # Một Gói: Chọn Quà Xong Mới Hiện Giá, Kho Và Số Dư.
+        if len(variants) == 1:
+            await show_reward_detail(query, uid, int(variants[0]["id"]))
+            return
+
+        # Nhiều Gói: Chỉ Hiện Tên Gói, Không Hiện Giá Ở Bước Chọn.
+        lines = [
+            f"<b>🎁 {escape(product)}</b>",
+            "",
+            "📦 Chọn Gói / Thời Hạn:",
+        ]
+        buttons = []
+        for r in variants:
+            option = reward_option_label(r)
+            buttons.append([
+                InlineKeyboardButton(
+                    f"📦 {option}",
+                    callback_data=f"reward:view:{r['id']}",
+                )
+            ])
+        back_data = "store:list:key_hack_game" if category == "key_hack_game" else "store:list:store"
+        buttons.append([InlineKeyboardButton("⬅️ Quay Lại", callback_data=back_data)])
         await safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(buttons))
         return
 
     if data.startswith("reward:view:"):
         rid = int(data.rsplit(":", 1)[1])
-        with db_connect() as conn:
-            r = conn.execute("SELECT * FROM rewards WHERE id=? AND active=1", (rid,)).fetchone()
-            if not r:
-                await answer_query(query, "Quà không tồn tại.", show_alert=True)
-                return
-            if r["delivery_type"] == "keypool":
-                stock = conn.execute("SELECT COUNT(*) AS c FROM reward_keys WHERE reward_id=? AND used=0", (rid,)).fetchone()["c"]
-            else:
-                stock = r["stock"]
-        stock_text = "∞" if stock < 0 else str(stock)
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Xác nhận đổi", callback_data=f"reward:buy:{rid}")],
-            [InlineKeyboardButton("⬅️ Đổi quà", callback_data="rewards")],
-        ])
-        await safe_edit(query, f"<b>🎁 {escape(r['name'])}</b>\n\n💰 Giá: <b>{fmt_xu(r['price'])}</b>\n📦 Còn: <b>{stock_text}</b>\n📨 Kiểu giao: <b>{escape(r['delivery_type'])}</b>", kb)
+        await show_reward_detail(query, uid, rid)
         return
 
     if data.startswith("reward:buy:"):
@@ -1268,15 +1774,22 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order_id = None
         with db_connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            r = conn.execute("SELECT * FROM rewards WHERE id=? AND active=1", (rid,)).fetchone()
-            u = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+            reward_sql = "SELECT * FROM rewards WHERE id=? AND active=1" + (" FOR UPDATE" if USE_SUPABASE_DB else "")
+            user_sql = "SELECT * FROM users WHERE user_id=?" + (" FOR UPDATE" if USE_SUPABASE_DB else "")
+            r = conn.execute(reward_sql, (rid,)).fetchone()
+            u = conn.execute(user_sql, (uid,)).fetchone()
             if not r:
-                conn.rollback(); await answer_query(query, "Quà không tồn tại.", show_alert=True); return
+                conn.rollback(); await answer_query(query, "Quà Không Tồn Tại.", show_alert=True); return
+            if int(r["price"] or 0) <= 0:
+                conn.rollback(); await answer_query(query, "Sản Phẩm Chưa Được Cấu Hình Giá.", show_alert=True); return
             if u["coins"] < r["price"]:
                 conn.rollback(); await answer_query(query, "Bạn không đủ xu.", show_alert=True); return
             delivery_type = r["delivery_type"]
             if delivery_type == "keypool":
-                keyrow = conn.execute("SELECT * FROM reward_keys WHERE reward_id=? AND used=0 ORDER BY id LIMIT 1", (rid,)).fetchone()
+                key_sql = "SELECT * FROM reward_keys WHERE reward_id=? AND used=0 ORDER BY id LIMIT 1"
+                if USE_SUPABASE_DB:
+                    key_sql += " FOR UPDATE SKIP LOCKED"
+                keyrow = conn.execute(key_sql, (rid,)).fetchone()
                 if not keyrow:
                     conn.rollback(); await answer_query(query, "Quà đã hết key.", show_alert=True); return
                 delivery = keyrow["value"]
@@ -1294,13 +1807,13 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             order_id = cur.lastrowid
             conn.execute("UPDATE users SET coins=coins-?, total_spent=total_spent+? WHERE user_id=?", (r["price"], r["price"], uid))
-            conn.execute("INSERT INTO transactions(user_id,type,amount,note,created_at) VALUES (?,?,?,?,?)", (uid, "redeem", -r["price"], f"Đổi quà: {r['name']}", now_iso()))
+            conn.execute("INSERT INTO transactions(user_id,type,amount,note,created_at) VALUES (?,?,?,?,?)", (uid, "redeem", -r["price"], f"Store: {reward_product_name(r)} - {reward_option_label(r)}", now_iso()))
             conn.commit()
         if delivery_type == "file_id" and delivery:
             try:
                 await context.bot.send_document(chat_id=uid, document=delivery, caption=display_title_case(f"✅ Quà: {r['name']}"))
             except Exception:
-                await send_bot_message(context, chat_id=uid, text="✅ Đổi quà thành công nhưng gửi file lỗi. Admin sẽ kiểm tra đơn của bạn.")
+                await send_bot_message(context, chat_id=uid, text="✅ Mua Sản Phẩm Thành Công Nhưng Gửi File Lỗi. Admin Sẽ Kiểm Tra Đơn Của Bạn.")
         elif delivery_type in ("text", "keypool") and delivery:
             await send_bot_message(context, chat_id=uid, text=f"✅ {r['name']}\n\n{delivery}")
         elif delivery_type == "manual":
@@ -1310,8 +1823,8 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await send_bot_message(context, admin_id, f"📦 Có đơn thủ công mới #{order_id}\nUser: {uid}\nQuà: {r['name']}\nGiá: {fmt_xu(r['price'])}")
                 except Exception:
                     pass
-        await answer_query(query, "Đổi quà thành công!", show_alert=True)
-        msg = f"✅ <b>ĐỔI QUÀ THÀNH CÔNG</b>\n\n🎁 {escape(r['name'])}\n💰 Đã trừ: <b>{fmt_xu(r['price'])}</b>"
+        await answer_query(query, "Mua Sản Phẩm Thành Công!", show_alert=True)
+        msg = f"✅ <b>MUA SẢN PHẨM THÀNH CÔNG</b>\n\n🛍️ {escape(reward_product_name(r))} — {escape(reward_option_label(r))}\n💰 Đã Trừ: <b>{fmt_xu(r['price'])}</b>"
         if delivery_type == "manual":
             msg += f"\n📦 Mã đơn: <code>#{order_id}</code>\nAdmin sẽ xử lý đơn này."
         else:
@@ -1473,16 +1986,16 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "adm:rewards":
         with db_connect() as conn:
             rows=conn.execute("SELECT * FROM rewards ORDER BY id DESC LIMIT 30").fetchall()
-        lines=["<b>🎁 QUẢN LÝ QUÀ</b>",""]
+        lines=["<b>🛍️ Quản Lý Sản Phẩm</b>",""]
         buttons=[
-            [InlineKeyboardButton("➕ Thêm quà",callback_data="adm:ask:reward_add")],
+            [InlineKeyboardButton("➕ Thêm Sản Phẩm",callback_data="adm:ask:reward_add")],
             [InlineKeyboardButton("📦 Đơn chờ duyệt",callback_data="adm:orders")],
         ]
         for r in rows:
             st="🟢" if r["active"] else "🔴"
             lines.append(f"{st} #{r['id']} <b>{escape(r['name'])}</b> — {fmt_xu(r['price'])} — {escape(r['delivery_type'])}")
             buttons.append([InlineKeyboardButton(f"{st} #{r['id']} {r['name'][:24]}",callback_data=f"adm:reward:{r['id']}")])
-        if not rows: lines.append("Chưa có quà.")
+        if not rows: lines.append("Chưa Có Sản Phẩm.")
         buttons.append([InlineKeyboardButton("⬅️ Admin",callback_data="adm:main")])
         await safe_edit(query,"\n".join(lines),InlineKeyboardMarkup(buttons)); return
 
@@ -1505,7 +2018,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rid=int(data.rsplit(":",1)[1])
         context.user_data["admin_action"]="reward_edit"
         context.user_data["edit_id"]=rid
-        await safe_edit(query,"<b>✏️ SỬA QUÀ</b>\n\nGửi:\n<code>Tên | Giá xu | Kho | Kiểu | Nội dung</code>\nKiểu: text/manual/keypool/file_id. Kho -1 = không giới hạn. Dùng <code>-</code> để giữ nội dung hiện tại.",InlineKeyboardMarkup([[InlineKeyboardButton("❌ Hủy",callback_data=f"adm:reward:{rid}")]])); return
+        await safe_edit(query,"<b>✏️ Sửa Sản Phẩm</b>\n\nGửi:\n<code>Sản Phẩm | Gói/Thời Hạn | Giá Xu | Kho | Kiểu | Nội Dung | Danh Mục</code>\nDanh Mục: <code>store</code> Hoặc <code>key_hack_game</code>.\nDùng <code>-</code> Để Giữ Nội Dung Giao Hiện Tại.",InlineKeyboardMarkup([[InlineKeyboardButton("❌ Hủy",callback_data=f"adm:reward:{rid}")]])); return
 
     if data == "adm:orders":
         with db_connect() as conn:
@@ -1536,7 +2049,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🧹 Xóa key chưa dùng",callback_data="adm:ask:clear_keys")],
             [InlineKeyboardButton("⬅️ Admin",callback_data="adm:main")],
         ])
-        await safe_edit(query,"<b>🔑 KEY / FILE</b>\n\n• TXT: mỗi dòng 1 key.\n• File Telegram: bot lưu file_id và tự gửi sau khi user đổi quà.",kb); return
+        await safe_edit(query,"<b>🔑 KEY / FILE</b>\n\n• TXT: mỗi dòng 1 key.\n• File Telegram: bot lưu file_id và tự gửi sau khi user mua sản phẩm.",kb); return
 
     if data == "adm:key_stock":
         with db_connect() as conn:
@@ -1577,7 +2090,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
               f"🎯 Nhiệm vụ hôm nay: <b>{fmt_num(claims)}</b>\n"
               f"📈 Nhiệm vụ 7 ngày: <b>{fmt_num(claims7)}</b>\n"
               f"💰 Tổng xu đã phát: <b>{fmt_xu(earned)}</b>\n"
-              f"🎁 Tổng đơn đổi quà: <b>{fmt_num(orders)}</b>\n"
+              f"🎁 Tổng Đơn Hàng: <b>{fmt_num(orders)}</b>\n"
               f"📦 Đơn chờ: <b>{fmt_num(pending)}</b>")
         await safe_edit(query,text,admin_back()); return
 
@@ -1703,7 +2216,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "subcoins":"Gửi theo mẫu: <code>USER_ID | SỐ_XU | GHI_CHÚ</code>",
             "giftall":"Gửi số xu muốn tặng cho <b>tất cả user chưa bị khóa</b>. Ví dụ: <code>1000</code>",
             "task_add":"Gửi 1 dòng:\n<code>Tên | Xu thưởng | Giới hạn/ngày | Chờ giây | Shortener ID</code>\nVí dụ: <code>Vượt Link 1 | 500 | 2 | 20 | 1</code>\nShortener ID có thể để 0 để bot dùng API active đầu tiên.",
-            "reward_add":"Gửi 1 dòng:\n<code>Tên | Giá xu | Kho | Kiểu | Nội dung</code>\nKiểu: <code>text</code>, <code>manual</code>, <code>keypool</code>, <code>file_id</code>.\nKho: -1 = không giới hạn.\nVí dụ: <code>Key VIP 1H | 5000 | -1 | keypool | -</code>",
+            "reward_add":"Gửi 1 Dòng Theo Mẫu:\n<code>Sản Phẩm | Gói/Thời Hạn | Giá Xu | Kho | Kiểu | Nội Dung | Danh Mục</code>\n\nDanh Mục: <code>store</code> Hoặc <code>key_hack_game</code>.\nKiểu: <code>text</code>, <code>manual</code>, <code>keypool</code>, <code>file_id</code>.\nKho: <code>-1</code> = Không Giới Hạn.\n\nVí Dụ Store:\n<code>Migul Pro VN | 1 Giờ | 7500 | -1 | keypool | - | store</code>\n\nVí Dụ Key Hack Game:\n<code>Free Fire Key | 1 Ngày | 5000 | -1 | keypool | - | key_hack_game</code>",
             "key_reward":"Gửi <b>ID quà</b> cần nhập key. Sau đó bot sẽ yêu cầu file .txt.",
             "file_reward":"Gửi <b>ID quà</b> cần gán file. Sau đó gửi file trực tiếp cho bot.",
             "clear_keys":"Gửi <b>ID quà</b> cần xóa toàn bộ key CHƯA DÙNG. Key đã phát vẫn được giữ trong lịch sử.",
@@ -1762,14 +2275,28 @@ async def show_admin_reward(query,rid:int):
         r=conn.execute("SELECT * FROM rewards WHERE id=?",(rid,)).fetchone()
         keys=conn.execute("SELECT COUNT(*) total,SUM(CASE WHEN used=0 THEN 1 ELSE 0 END) available FROM reward_keys WHERE reward_id=?",(rid,)).fetchone()
         orders=conn.execute("SELECT COUNT(*) c FROM orders WHERE reward_id=?",(rid,)).fetchone()["c"]
-    if not r: await safe_edit(query,"Không tìm thấy quà.",admin_back("rewards")); return
-    st="🟢 Bật" if r["active"] else "🔴 Tắt"; stock="∞" if r["stock"]<0 else str(r["stock"])
+    if not r:
+        await safe_edit(query,"Không Tìm Thấy Sản Phẩm.",admin_back("rewards"))
+        return
+    st="🟢 Bật" if r["active"] else "🔴 Tắt"
+    stock="∞" if r["stock"]<0 else str(r["stock"])
     kb=InlineKeyboardMarkup([
         [InlineKeyboardButton("✏️ Sửa",callback_data=f"adm:reward:edit:{rid}"), InlineKeyboardButton("🔄 Bật/Tắt",callback_data=f"adm:reward:toggle:{rid}")],
-        [InlineKeyboardButton("🗑 Ẩn quà",callback_data=f"adm:reward:delete:{rid}")],
-        [InlineKeyboardButton("⬅️ Quà tặng",callback_data="adm:rewards")],
+        [InlineKeyboardButton("🗑 Ẩn Sản Phẩm",callback_data=f"adm:reward:delete:{rid}")],
+        [InlineKeyboardButton("⬅️ Quà Tặng",callback_data="adm:rewards")],
     ])
-    text=(f"<b>🎁 QUÀ #{rid}</b>\n\nTên: <b>{escape(r['name'])}</b>\nGiá: <b>{fmt_xu(r['price'])}</b>\nKho cấu hình: <b>{stock}</b>\nKiểu giao: <b>{escape(r['delivery_type'])}</b>\nKey còn: <b>{keys['available'] or 0}/{keys['total'] or 0}</b>\nĐã có đơn: <b>{orders}</b>\nTrạng thái: <b>{st}</b>")
+    text=(
+        f"<b>🛍️ Sản Phẩm #{rid}</b>\n\n"
+        f"Sản Phẩm: <b>{escape(reward_product_name(r))}</b>\n"
+        f"Gói/Thời Hạn: <b>{escape(reward_option_label(r))}</b>\n"
+        f"Danh Mục: <b>{escape(reward_category(r))}</b>\n"
+        f"Giá: <b>{fmt_xu(r['price'])}</b>\n"
+        f"Kho Cấu Hình: <b>{stock}</b>\n"
+        f"Kiểu Giao: <b>{escape(r['delivery_type'])}</b>\n"
+        f"Key Còn: <b>{keys['available'] or 0}/{keys['total'] or 0}</b>\n"
+        f"Đã Có Đơn: <b>{orders}</b>\n"
+        f"Trạng Thái: <b>{st}</b>"
+    )
     await safe_edit(query,text,kb)
 
 
@@ -1798,8 +2325,9 @@ async def approve_order(query,context,oid:int,aid:int):
 async def reject_order(query,context,oid:int,aid:int):
     with db_connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        o=conn.execute("SELECT * FROM orders WHERE id=?",(oid,)).fetchone()
-        if not o or o["status"]!="pending": conn.rollback(); await answer_query(query, "Đơn không ở trạng thái chờ.",show_alert=True); return
+        order_sql = "SELECT * FROM orders WHERE id=?" + (" FOR UPDATE" if USE_SUPABASE_DB else "")
+        o=conn.execute(order_sql,(oid,)).fetchone()
+        if not o or o["status"]!="pending": conn.rollback(); await answer_query(query, "Đơn Không Ở Trạng Thái Chờ.",show_alert=True); return
         conn.execute("UPDATE orders SET status='rejected',updated_at=? WHERE id=?",(now_iso(),oid))
         conn.execute("UPDATE users SET coins=coins+?, total_spent=MAX(0,total_spent-?) WHERE user_id=?",(o["price"],o["price"],o["user_id"]))
         conn.execute("INSERT INTO transactions(user_id,type,amount,note,created_at) VALUES (?,?,?,?,?)",(o["user_id"],"refund",o["price"],f"Hoàn xu đơn #{oid}",now_iso()))
@@ -1889,24 +2417,66 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_reply(update, f"✅ Đã {'thêm' if action=='task_add' else 'cập nhật'} nhiệm vụ #{tid}: {name}",reply_markup=admin_main_keyboard()); return
 
         if action in {"reward_add","reward_edit"}:
-            p=[x.strip() for x in text.split("|",4)]
-            if len(p)<5: raise ValueError("Cần đủ 5 trường")
-            name=p[0]; price=int(p[1]); stock=int(p[2]); typ=p[3].lower(); raw_value=p[4]
-            if typ not in {"text","manual","keypool","file_id"}: raise ValueError("Kiểu phải là text/manual/keypool/file_id")
-            if price<0 or stock<-1: raise ValueError("Giá/kho không hợp lệ")
+            # Hỗ Trợ 3 Kiểu Nhập:
+            # Cũ: Tên | Giá | Kho | Kiểu | Nội Dung
+            # Mới: Sản Phẩm | Gói | Giá | Kho | Kiểu | Nội Dung
+            # Đầy Đủ: Sản Phẩm | Gói | Giá | Kho | Kiểu | Nội Dung | Danh Mục
+            p=[x.strip() for x in text.split("|")]
+            if len(p) == 5:
+                product_name = p[0]
+                option_label = "Mặc Định"
+                price = int(p[1])
+                stock = int(p[2])
+                typ = p[3].lower()
+                raw_value = p[4]
+                category = "store"
+            elif len(p) in {6, 7}:
+                product_name = p[0]
+                option_label = p[1] or "Mặc Định"
+                price = int(p[2])
+                stock = int(p[3])
+                typ = p[4].lower()
+                raw_value = p[5]
+                category = normalize_reward_category(p[6] if len(p) == 7 else "store")
+            else:
+                raise ValueError("Cần 5, 6 Hoặc 7 Trường")
+
+            if typ not in {"text","manual","keypool","file_id"}:
+                raise ValueError("Kiểu Phải Là text/manual/keypool/file_id")
+            if price < 0 or stock < -1:
+                raise ValueError("Giá/Kho Không Hợp Lệ")
+            if category not in {"store", "key_hack_game"}:
+                raise ValueError("Danh Mục Chỉ Nhận store Hoặc key_hack_game")
+
+            name = f"{product_name} - {option_label}" if option_label != "Mặc Định" else product_name
             with db_connect() as conn:
                 if action=="reward_add":
                     value="" if raw_value=="-" else raw_value
-                    cur=conn.execute("INSERT INTO rewards(name,price,stock,delivery_type,delivery_value,created_at) VALUES (?,?,?,?,?,?)",(name,price,stock,typ,value,now_iso())); rid=cur.lastrowid
+                    cur=conn.execute(
+                        "INSERT INTO rewards(name,product_name,option_label,category,price,stock,delivery_type,delivery_value,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                        (name,product_name,option_label,category,price,stock,typ,value,now_iso()),
+                    )
+                    rid=cur.lastrowid
                 else:
                     rid=int(context.user_data.get("edit_id",0))
                     oldrow=conn.execute("SELECT * FROM rewards WHERE id=?",(rid,)).fetchone()
-                    if not oldrow: raise ValueError("Quà không tồn tại")
+                    if not oldrow:
+                        raise ValueError("Sản Phẩm Không Tồn Tại")
                     value=oldrow["delivery_value"] if raw_value=="-" else raw_value
-                    conn.execute("UPDATE rewards SET name=?,price=?,stock=?,delivery_type=?,delivery_value=? WHERE id=?",(name,price,stock,typ,value,rid))
+                    conn.execute(
+                        "UPDATE rewards SET name=?,product_name=?,option_label=?,category=?,price=?,stock=?,delivery_type=?,delivery_value=? WHERE id=?",
+                        (name,product_name,option_label,category,price,stock,typ,value,rid),
+                    )
                 conn.commit()
-            log_admin(aid,"add_reward" if action=="reward_add" else "edit_reward",str(rid)); context.user_data.pop("admin_action",None); context.user_data.pop("edit_id",None)
-            await send_reply(update, f"✅ Đã {'thêm' if action=='reward_add' else 'cập nhật'} quà #{rid}: {name}",reply_markup=admin_main_keyboard()); return
+            log_admin(aid,"add_reward" if action=="reward_add" else "edit_reward",str(rid))
+            context.user_data.pop("admin_action",None)
+            context.user_data.pop("edit_id",None)
+            await send_reply(
+                update,
+                f"✅ Đã {'Thêm' if action=='reward_add' else 'Cập Nhật'} Sản Phẩm #{rid}: {product_name} — {option_label}",
+                reply_markup=admin_main_keyboard(),
+            )
+            return
 
         if action=="key_reward":
             rid=int(text)
@@ -1976,7 +2546,7 @@ async def admin_document_input(update: Update, context: ContextTypes.DEFAULT_TYP
         with db_connect() as conn:
             conn.execute("UPDATE rewards SET delivery_type='file_id',delivery_value=? WHERE id=?",(doc.file_id,rid)); conn.commit()
         log_admin(update.effective_user.id,"assign_file",str(rid)); context.user_data.pop("admin_action",None); context.user_data.pop("reward_id",None)
-        await send_reply(update, f"✅ Đã gán file Telegram cho quà #{rid}. Bot sẽ tự gửi file này khi user đổi quà.",reply_markup=admin_main_keyboard()); return
+        await send_reply(update, f"✅ Đã gán file Telegram cho quà #{rid}. Bot sẽ tự gửi file này khi user mua sản phẩm.",reply_markup=admin_main_keyboard()); return
     if not (doc.file_name or "").lower().endswith(".txt"):
         await send_reply(update, "❌ Hãy gửi file .txt, mỗi dòng 1 key."); return
     if doc.file_size and doc.file_size>2_000_000:
