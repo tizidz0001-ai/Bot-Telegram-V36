@@ -126,6 +126,71 @@ def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+_PG_BOOL_COLUMNS = {"active", "used", "banned"}
+
+
+def _pg_coerce_bool_params(sql: str, params=()):
+    """Đổi 0/1 Thành False/True Cho Các Cột Boolean Khi Dùng PostgreSQL."""
+    values = list(params or ())
+    if not values:
+        return tuple(values)
+
+    m = re.search(
+        r"INSERT\\s+(?:OR\\s+IGNORE\\s+)?INTO\\s+[^\\s(]+\\s*\\(([^)]+)\\)\\s*VALUES\\s*\\(([^)]+)\\)",
+        sql,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if m:
+        columns = [c.strip().strip('"').lower() for c in m.group(1).split(",")]
+        for i, col in enumerate(columns):
+            if i < len(values) and col in _PG_BOOL_COLUMNS and values[i] is not None:
+                values[i] = bool(values[i])
+
+    parts = sql.split("?")
+    for i in range(min(len(values), len(parts) - 1)):
+        before = parts[i]
+        m2 = re.search(r"(active|used|banned)\\s*=\\s*$", before, flags=re.IGNORECASE)
+        if m2 and values[i] is not None:
+            values[i] = bool(values[i])
+
+    return tuple(values)
+
+
+def _pg_translate_boolean_sql(raw: str) -> str:
+    """Chuyển Các So Sánh 0/1 Cũ Sang Boolean PostgreSQL."""
+    raw = re.sub(
+        r"\\b(active|used|banned)\\s*=\\s*CASE\\s+\\1\\s+WHEN\\s+1\\s+THEN\\s+0\\s+ELSE\\s+1\\s+END",
+        lambda m: f"{m.group(1)}=NOT {m.group(1)}",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    raw = re.sub(
+        r"(\\bSET\\s+|,\\s*)(active|used|banned)\\s*=\\s*1\\b",
+        lambda m: f"{m.group(1)}{m.group(2)}=TRUE",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    raw = re.sub(
+        r"(\\bSET\\s+|,\\s*)(active|used|banned)\\s*=\\s*0\\b",
+        lambda m: f"{m.group(1)}{m.group(2)}=FALSE",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    raw = re.sub(
+        r"((?:\\b[A-Za-z_]\\w*\\.)?\\b(?:active|used|banned))\\s*=\\s*1\\b",
+        r"\\1 IS TRUE",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    raw = re.sub(
+        r"((?:\\b[A-Za-z_]\\w*\\.)?\\b(?:active|used|banned))\\s*=\\s*0\\b",
+        r"\\1 IS FALSE",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    return raw
+
+
 def _pg_translate_sql(sql: str) -> tuple[str, bool]:
     """Chuyển Cú Pháp SQLite Đang Dùng Sang PostgreSQL/Supabase."""
     raw = sql.strip()
@@ -135,15 +200,16 @@ def _pg_translate_sql(sql: str) -> tuple[str, bool]:
 
     ignore = "INSERT OR IGNORE INTO" in upper
     if ignore:
-        raw = re.sub(r"INSERT\s+OR\s+IGNORE\s+INTO", "INSERT INTO", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"INSERT\\s+OR\\s+IGNORE\\s+INTO", "INSERT INTO", raw, flags=re.IGNORECASE)
 
+    raw = _pg_translate_boolean_sql(raw)
     raw = raw.replace("?", "%s")
-    raw = re.sub(r"MAX\(0\s*,\s*total_spent\s*-\s*%s\)", "GREATEST(0,total_spent-%s)", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"MAX\\(0\\s*,\\s*total_spent\\s*-\\s*%s\\)", "GREATEST(0,total_spent-%s)", raw, flags=re.IGNORECASE)
 
     if ignore and "ON CONFLICT" not in raw.upper():
         raw = raw.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
 
-    m = re.match(r"\s*INSERT\s+INTO\s+(tasks|rewards|orders|shorteners)\b", raw, flags=re.IGNORECASE)
+    m = re.match(r"\\s*INSERT\\s+INTO\\s+(tasks|rewards|orders|shorteners)\\b", raw, flags=re.IGNORECASE)
     wants_lastrowid = bool(m) and "RETURNING" not in raw.upper() and not ignore
     if wants_lastrowid:
         raw = raw.rstrip().rstrip(";") + " RETURNING id"
@@ -195,7 +261,8 @@ class _PostgresCompatConnection:
 
     def execute(self, sql, params=()):
         translated, wants_lastrowid = _pg_translate_sql(sql)
-        cur = self._conn.execute(translated, params or ())
+        pg_params = _pg_coerce_bool_params(sql, params)
+        cur = self._conn.execute(translated, pg_params)
         lastrowid = None
         if wants_lastrowid:
             row = cur.fetchone()
@@ -205,8 +272,9 @@ class _PostgresCompatConnection:
 
     def executemany(self, sql, seq_of_params):
         translated, _ = _pg_translate_sql(sql)
+        pg_rows = [_pg_coerce_bool_params(sql, row) for row in seq_of_params]
         cur = self._conn.cursor()
-        cur.executemany(translated, seq_of_params)
+        cur.executemany(translated, pg_rows)
         return _CompatCursor(cur)
 
     def commit(self):
@@ -250,7 +318,7 @@ def _init_postgres_db():
                 coins BIGINT NOT NULL DEFAULT 0,
                 total_earned BIGINT NOT NULL DEFAULT 0,
                 total_spent BIGINT NOT NULL DEFAULT 0,
-                banned INTEGER NOT NULL DEFAULT 0,
+                banned BOOLEAN NOT NULL DEFAULT FALSE,
                 created_at TEXT NOT NULL,
                 last_seen TEXT
             )
@@ -265,7 +333,7 @@ def _init_postgres_db():
                 daily_limit INTEGER NOT NULL DEFAULT 1,
                 min_seconds INTEGER NOT NULL DEFAULT 20,
                 shortener_id BIGINT,
-                active INTEGER NOT NULL DEFAULT 1,
+                active BOOLEAN NOT NULL DEFAULT TRUE,
                 created_at TEXT NOT NULL
             )
             """
@@ -293,7 +361,7 @@ def _init_postgres_db():
                 name TEXT NOT NULL,
                 api_template TEXT NOT NULL,
                 response_key TEXT,
-                active INTEGER NOT NULL DEFAULT 1,
+                active BOOLEAN NOT NULL DEFAULT TRUE,
                 created_at TEXT NOT NULL
             )
             """
@@ -311,7 +379,7 @@ def _init_postgres_db():
                 stock INTEGER NOT NULL DEFAULT -1,
                 delivery_type TEXT NOT NULL DEFAULT 'manual',
                 delivery_value TEXT,
-                active INTEGER NOT NULL DEFAULT 1,
+                active BOOLEAN NOT NULL DEFAULT TRUE,
                 created_at TEXT NOT NULL
             )
             """
@@ -327,7 +395,7 @@ def _init_postgres_db():
                 id BIGSERIAL PRIMARY KEY,
                 reward_id BIGINT NOT NULL,
                 value TEXT NOT NULL,
-                used INTEGER NOT NULL DEFAULT 0,
+                used BOOLEAN NOT NULL DEFAULT FALSE,
                 user_id BIGINT,
                 used_at TEXT,
                 UNIQUE(reward_id, value)
