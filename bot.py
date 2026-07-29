@@ -1,17 +1,19 @@
 import asyncio
 import json
 import os
+import re
 import secrets
 import sqlite3
 from datetime import datetime, timedelta
 from html import escape
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import quote
 
 import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
@@ -32,10 +34,71 @@ ENV_CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@yourchannel").strip()
 ENV_SUPPORT_URL = os.getenv("SUPPORT_URL", "https://t.me/tizimod").strip()
 DB_PATH = os.getenv("DB_PATH", "bot.db").strip()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+TRAFFICVN_API_KEY = os.getenv("TRAFFICVN_API_KEY", "").strip()
+TRAFFICVN_API_URL = os.getenv("TRAFFICVN_API_URL", "https://trafficvn.com/api").strip() or "https://trafficvn.com/api"
+TRAFFICVN_FALLBACK_URL = os.getenv("TRAFFICVN_FALLBACK_URL", "").strip()
 PORT = int(os.getenv("PORT", "8080") or 8080)
 
 HTTP_RUNNER = None
 BOT_USERNAME = ""
+
+
+_PROTECTED_DISPLAY_RE = re.compile(
+    r"(<code>.*?</code>|<pre>.*?</pre>|https?://[^\s<]+|t\.me/[^\s<]+|@[A-Za-z0-9_]+|/[A-Za-z0-9_]+|<[^>]+>)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def display_title_case(text: str) -> str:
+    """Viết Hoa Chữ Cái Đầu Của Mọi Từ Hiển Thị, Nhưng Giữ Nguyên Dữ Liệu Kỹ Thuật."""
+    if not isinstance(text, str) or not text:
+        return text
+    parts = _PROTECTED_DISPLAY_RE.split(text)
+    output = []
+    for part in parts:
+        if not part:
+            continue
+        if _PROTECTED_DISPLAY_RE.fullmatch(part):
+            output.append(part)
+        else:
+            output.append(part.title())
+    return "".join(output)
+
+
+_TELEGRAM_INLINE_KEYBOARD_BUTTON = InlineKeyboardButton
+_TELEGRAM_KEYBOARD_BUTTON = KeyboardButton
+
+
+def InlineKeyboardButton(text, *args, **kwargs):
+    """Tự Động Viết Hoa Chữ Cái Đầu Cho Mọi Nút Inline."""
+    return _TELEGRAM_INLINE_KEYBOARD_BUTTON(display_title_case(str(text)), *args, **kwargs)
+
+
+def KeyboardButton(text, *args, **kwargs):
+    """Tự Động Viết Hoa Chữ Cái Đầu Cho Mọi Nút Reply Keyboard."""
+    return _TELEGRAM_KEYBOARD_BUTTON(display_title_case(str(text)), *args, **kwargs)
+
+
+async def send_reply(update, text, *args, **kwargs):
+    """Gửi Tin Nhắn Và Tự Động Chuẩn Hóa Kiểu Chữ Hiển Thị."""
+    return await update.message.reply_text(display_title_case(text), *args, **kwargs)
+
+
+async def answer_query(query, text=None, *args, **kwargs):
+    """Hiển Thị Popup Callback Với Kiểu Chữ Đồng Nhất."""
+    if isinstance(text, str):
+        text = display_title_case(text)
+    return await query.answer(text, *args, **kwargs)
+
+
+async def send_bot_message(context, *args, **kwargs):
+    """Gửi Tin Nhắn Chủ Động Và Tự Động Viết Hoa Chữ Cái Đầu."""
+    args = list(args)
+    if "text" in kwargs and isinstance(kwargs["text"], str):
+        kwargs["text"] = display_title_case(kwargs["text"])
+    elif len(args) >= 2 and isinstance(args[1], str):
+        args[1] = display_title_case(args[1])
+    return await context.bot.send_message(*args, **kwargs)
 
 
 def now_iso() -> str:
@@ -215,6 +278,19 @@ def init_db():
         }
         for k, v in defaults.items():
             conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", (k, str(v)))
+
+        # Tự Thêm TrafficVN Khi API Key Được Lưu An Toàn Trong Render Environment.
+        # API Key Không Được Ghi Vào SQLite Hoặc Hiển Thị Trong Telegram.
+        if TRAFFICVN_API_KEY:
+            existing_trafficvn = conn.execute(
+                "SELECT id FROM shorteners WHERE lower(name)=lower(?) LIMIT 1",
+                ("TrafficVN",),
+            ).fetchone()
+            if not existing_trafficvn:
+                conn.execute(
+                    "INSERT INTO shorteners(name,api_template,response_key,active,created_at) VALUES (?,?,?,?,?)",
+                    ("TrafficVN", "trafficvn://env", "", 1, now_iso()),
+                )
         conn.commit()
 
 
@@ -246,7 +322,7 @@ def ensure_user(update: Update):
     user = update.effective_user
     if not user:
         return
-    full_name = " ".join(x for x in [user.first_name, user.last_name] if x)
+    full_name = " ".join(x for x in [user.first_name, user.last_name] if x).title()
     with db_connect() as conn:
         conn.execute(
             """
@@ -293,22 +369,39 @@ def fmt_xu(value: int) -> str:
     return f"{fmt_num(value)} Xu"
 
 
-def home_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+def home_keyboard() -> ReplyKeyboardMarkup:
+    """Menu chính dạng bàn phím Telegram, luôn nằm dưới ô nhập tin nhắn."""
+    return ReplyKeyboardMarkup(
         [
-            InlineKeyboardButton("👤 Tài khoản", callback_data="account"),
-            InlineKeyboardButton("🎯 Làm nhiệm vụ", callback_data="tasks"),
+            [KeyboardButton("👤 Tài Khoản"), KeyboardButton("🎯 Làm Nhiệm Vụ")],
+            [KeyboardButton("🎁 Đổi Quà"), KeyboardButton("📜 Lịch Sử")],
+            [KeyboardButton("🏆 BXH"), KeyboardButton("📖 Hướng Dẫn")],
+            [KeyboardButton("🕺 Hỗ Trợ / Liên Hệ")],
         ],
+        resize_keyboard=True,
+        is_persistent=True,
+        one_time_keyboard=False,
+        input_field_placeholder="Chọn Một Chức Năng...",
+    )
+
+
+def admin_keyboard() -> ReplyKeyboardMarkup:
+    """Menu Admin Cố Định Trong Bàn Phím Telegram, Giống Menu Người Dùng."""
+    return ReplyKeyboardMarkup(
         [
-            InlineKeyboardButton("🎁 Đổi quà", callback_data="rewards"),
-            InlineKeyboardButton("📜 Lịch sử", callback_data="history"),
+            [KeyboardButton("👥 Người Dùng"), KeyboardButton("🎯 Nhiệm Vụ")],
+            [KeyboardButton("💰 Quản Lý Xu"), KeyboardButton("🎁 Quà Tặng")],
+            [KeyboardButton("🔑 Key / File"), KeyboardButton("📊 Thống Kê")],
+            [KeyboardButton("📢 Thông Báo"), KeyboardButton("⚙️ Cài Đặt")],
+            [KeyboardButton("🛡 Bảo Mật"), KeyboardButton("🔗 Api Rút Gọn")],
+            [KeyboardButton("📜 Lịch Sử Hệ Thống"), KeyboardButton("📦 Đơn Đổi Quà")],
+            [KeyboardButton("🏠 Menu Người Dùng")],
         ],
-        [
-            InlineKeyboardButton("🏆 BXH", callback_data="leaderboard"),
-            InlineKeyboardButton("📖 Hướng dẫn", callback_data="guide"),
-        ],
-        [InlineKeyboardButton("🕺 Hỗ trợ / Liên hệ", url=get_setting("support_url", ENV_SUPPORT_URL))],
-    ])
+        resize_keyboard=True,
+        is_persistent=True,
+        one_time_keyboard=False,
+        input_field_placeholder="Chọn Một Chức Năng Quản Trị...",
+    )
 
 
 def back_home() -> InlineKeyboardMarkup:
@@ -341,14 +434,14 @@ def home_text(user_id: int) -> str:
     channel = escape(get_setting("channel_username", ENV_CHANNEL_USERNAME))
     admin = escape(get_setting("admin_username", ENV_ADMIN_USERNAME))
     return (
-        "<b>CHÀO MỪNG BẠN ĐẾN VỚI BOT NHIỆM VỤ NHẬN XU</b>\n\n"
+        "<b>Chào Mừng Bạn Đến Với Bot Nhiệm Vụ Nhận Xu</b>\n\n"
         "<blockquote>"
-        f"🌐 <b>Kênh thông báo:</b> {channel}\n"
+        f"🌐 <b>Kênh Thông Báo:</b> {channel}\n"
         f"🧑‍💼 <b>Admin:</b> {admin}\n"
         "➖ ➖ ➖ ➖ ➖ ➖ ➖ ➖\n"
-        f"🏅 <b>Tổng xu đã kiếm:</b> {fmt_xu(earned)}\n"
-        f"🎁 <b>Tổng xu đã đổi:</b> {fmt_xu(spent)}\n"
-        f"💰 <b>Số dư:</b> {fmt_xu(coins)}"
+        f"🏅 <b>Tổng Xu Đã Kiếm:</b> {fmt_xu(earned)}\n"
+        f"🎁 <b>Tổng Xu Đã Đổi:</b> {fmt_xu(spent)}\n"
+        f"💰 <b>Số Dư:</b> {fmt_xu(coins)}"
         "</blockquote>"
     )
 
@@ -356,7 +449,7 @@ def home_text(user_id: int) -> str:
 async def safe_edit(query, text: str, keyboard=None):
     try:
         await query.edit_message_text(
-            text=text,
+            text=display_title_case(text),
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard or back_home(),
             disable_web_page_preview=True,
@@ -366,33 +459,398 @@ async def safe_edit(query, text: str, keyboard=None):
             raise
 
 
+def claim_task_session(user_id: int, token: str):
+    """Nhận Xu Từ Một Phiên Đã Được Máy Chủ Xác Nhận Hoàn Thành."""
+    with db_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT s.*,t.name,t.reward,t.daily_limit FROM task_sessions s JOIN tasks t ON t.id=s.task_id WHERE s.token=?",
+            (token,),
+        ).fetchone()
+        if not row or row["user_id"] != user_id:
+            conn.rollback()
+            return "invalid", None, None
+
+        row_data = dict(row)
+        if row["status"] == "claimed":
+            balance = conn.execute("SELECT coins FROM users WHERE user_id=?", (user_id,)).fetchone()
+            conn.rollback()
+            return "already", row_data, int(balance["coins"] if balance else 0)
+
+        if row["status"] != "completed":
+            conn.rollback()
+            return "not_completed", row_data, None
+
+        if claimed_today(conn, user_id, row["task_id"]) >= row["daily_limit"]:
+            conn.rollback()
+            return "limit", row_data, None
+
+        cur = conn.execute(
+            "UPDATE task_sessions SET status='claimed', claimed_at=? WHERE token=? AND status='completed'",
+            (now_iso(), token),
+        )
+        if cur.rowcount != 1:
+            conn.rollback()
+            return "processed", row_data, None
+
+        conn.execute(
+            "UPDATE users SET coins=coins+?, total_earned=total_earned+? WHERE user_id=?",
+            (row["reward"], row["reward"], user_id),
+        )
+        conn.execute(
+            "INSERT INTO transactions(user_id,type,amount,note,created_at) VALUES (?,?,?,?,?)",
+            (user_id, "task_reward", row["reward"], f"Nhiệm Vụ: {row['name']}", now_iso()),
+        )
+        balance = conn.execute("SELECT coins FROM users WHERE user_id=?", (user_id,)).fetchone()["coins"]
+        conn.commit()
+        return "success", row_data, int(balance)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
     uid = update.effective_user.id
     if is_banned(uid):
-        await update.message.reply_text("🚫 Tài khoản của bạn đã bị khóa. Liên hệ admin để được hỗ trợ.")
+        await send_reply(update, "🚫 Tài Khoản Của Bạn Đã Bị Khóa. Liên Hệ Admin Để Được Hỗ Trợ.")
         return
     if get_setting("maintenance", "0") == "1" and not is_admin(update):
-        await update.message.reply_text("🛠 Bot đang bảo trì. Vui lòng quay lại sau.")
+        await send_reply(update, "🛠 Bot Đang Bảo Trì. Vui Lòng Quay Lại Sau.")
         return
-    await update.message.reply_text(home_text(uid), parse_mode=ParseMode.HTML, reply_markup=home_keyboard())
+
+    # Deep Link Sau Khi Vượt Link: https://t.me/TenBot?start=claim_TOKEN
+    payload = (context.args[0] if context.args else "").strip()
+    if payload.startswith("claim_"):
+        token = payload[len("claim_"):].strip()
+        status, row, balance = claim_task_session(uid, token)
+
+        if status == "success":
+            await send_reply(
+                update,
+                f"✅ <b>Hoàn Thành Nhiệm Vụ</b>\n\n"
+                f"🎯 Nhiệm Vụ: <b>{escape(row['name'])}</b>\n"
+                f"💰 Bạn Nhận Được: <b>+{fmt_xu(row['reward'])}</b>\n"
+                f"💳 Số Dư Hiện Tại: <b>{fmt_xu(balance)}</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=home_keyboard(),
+            )
+            return
+
+        if status == "already":
+            await send_reply(
+                update,
+                f"✅ Phiên Này Đã Nhận Xu Trước Đó.\n\n💳 Số Dư Hiện Tại: <b>{fmt_xu(balance)}</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=home_keyboard(),
+            )
+            return
+
+        if status == "not_completed":
+            await send_reply(
+                update,
+                "⚠️ Phiên Này Chưa Được Xác Nhận Hoàn Thành. Vui Lòng Vượt Link Đến Bước Cuối.",
+                reply_markup=home_keyboard(),
+            )
+            return
+
+        if status == "limit":
+            await send_reply(
+                update,
+                "⛔ Bạn Đã Đạt Giới Hạn Nhận Xu Của Nhiệm Vụ Này Hôm Nay.",
+                reply_markup=home_keyboard(),
+            )
+            return
+
+        if status == "processed":
+            await send_reply(
+                update,
+                "ℹ️ Phiên Này Đã Được Xử Lý. Vui Lòng Kiểm Tra Lịch Sử Và Số Dư.",
+                reply_markup=home_keyboard(),
+            )
+            return
+
+        await send_reply(
+            update,
+            "❌ Link Xác Nhận Không Hợp Lệ Hoặc Không Thuộc Tài Khoản Của Bạn.",
+            reply_markup=home_keyboard(),
+        )
+        return
+
+    await send_reply(update, home_text(uid), parse_mode=ParseMode.HTML, reply_markup=home_keyboard())
+
+
+async def native_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Xử lý các nút menu cố định của Telegram (Reply Keyboard)."""
+    ensure_user(update)
+    uid = update.effective_user.id
+    text = (update.message.text or "").strip()
+
+    if is_banned(uid) and not is_admin(update):
+        await send_reply(update, 
+            "🚫 Tài Khoản Của Bạn Đã Bị Khóa. Liên Hệ Admin Để Được Hỗ Trợ.",
+            reply_markup=home_keyboard(),
+        )
+        return
+
+    if get_setting("maintenance", "0") == "1" and not is_admin(update):
+        await send_reply(update, 
+            "🛠 Bot Đang Bảo Trì. Vui Lòng Quay Lại Sau.",
+            reply_markup=home_keyboard(),
+        )
+        return
+
+    # Khi bấm menu chính thì hủy trạng thái nhập liệu admin đang dang dở.
+    context.user_data.pop("admin_action", None)
+
+    if text == "👤 Tài Khoản":
+        with db_connect() as conn:
+            u = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+        username = f"@{update.effective_user.username}" if update.effective_user.username else "Chưa Đặt"
+        full_name = (u["full_name"] or update.effective_user.full_name or "").title()
+        msg = (
+            "<b>👤 Thông Tin Tài Khoản</b>\n\n"
+            f"👤 Họ Tên: <b>{escape(full_name)}</b>\n"
+            f"🆔 ID: <code>{uid}</code>\n"
+            f"🔗 Username: {escape(username)}\n"
+            f"💰 Số Dư: <b>{fmt_xu(u['coins'])}</b>\n"
+            f"🏅 Đã Kiếm: <b>{fmt_xu(u['total_earned'])}</b>\n"
+            f"🎁 Đã Đổi: <b>{fmt_xu(u['total_spent'])}</b>"
+        )
+        await send_reply(update, msg, parse_mode=ParseMode.HTML, reply_markup=home_keyboard())
+        return
+
+    if text == "🎯 Làm Nhiệm Vụ":
+        with db_connect() as conn:
+            tasks = conn.execute("SELECT * FROM tasks WHERE active=1 ORDER BY id").fetchall()
+            lines = ["<b>🎯 Nhiệm Vụ Nhận Xu</b>", ""]
+            buttons = []
+            if not tasks:
+                lines.append("Hiện Chưa Có Nhiệm Vụ.")
+            for t in tasks:
+                done = claimed_today(conn, uid, t["id"])
+                left = max(0, t["daily_limit"] - done)
+                lines.append(
+                    f"• <b>{escape(str(t['name']).title())}</b> — +{fmt_xu(t['reward'])} — Còn {left}/{t['daily_limit']} Lượt"
+                )
+                # Danh sách nhiệm vụ động vẫn dùng Inline Button vì cần callback_data riêng cho từng nhiệm vụ.
+                buttons.append([InlineKeyboardButton(
+                    f"🎯 {str(t['name']).title()} (+{fmt_num(t['reward'])} Xu)",
+                    callback_data=f"task:start:{t['id']}",
+                )])
+        await send_reply(update, 
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons) if buttons else home_keyboard(),
+        )
+        return
+
+    if text == "🎁 Đổi Quà":
+        with db_connect() as conn:
+            rewards = conn.execute("SELECT * FROM rewards WHERE active=1 ORDER BY id").fetchall()
+            user = conn.execute("SELECT coins FROM users WHERE user_id=?", (uid,)).fetchone()
+            lines = ["<b>🎁 Đổi Quà</b>", f"💰 Số Dư: <b>{fmt_xu(user['coins'])}</b>", ""]
+            buttons = []
+            if not rewards:
+                lines.append("Hiện Chưa Có Quà.")
+            for r in rewards:
+                if r["delivery_type"] == "keypool":
+                    available = conn.execute(
+                        "SELECT COUNT(*) AS c FROM reward_keys WHERE reward_id=? AND used=0", (r["id"],)
+                    ).fetchone()["c"]
+                    stock_text = str(available)
+                else:
+                    stock_text = "∞" if r["stock"] < 0 else str(r["stock"])
+                lines.append(
+                    f"• <b>{escape(str(r['name']).title())}</b> — {fmt_xu(r['price'])} — Kho {stock_text}"
+                )
+                buttons.append([InlineKeyboardButton(
+                    f"🎁 {str(r['name']).title()} — {fmt_num(r['price'])} Xu",
+                    callback_data=f"reward:view:{r['id']}",
+                )])
+        await send_reply(update, 
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons) if buttons else home_keyboard(),
+        )
+        return
+
+    if text == "📜 Lịch Sử":
+        with db_connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM transactions WHERE user_id=? ORDER BY id DESC LIMIT 15", (uid,)
+            ).fetchall()
+        lines = ["<b>📜 Lịch Sử Gần Đây</b>", ""]
+        if not rows:
+            lines.append("Chưa Có Giao Dịch.")
+        for r in rows:
+            sign = "+" if r["amount"] > 0 else ""
+            note = str(r["note"] or r["type"]).title()
+            lines.append(
+                f"• {escape(note)}: <b>{sign}{fmt_num(r['amount'])} Xu</b>\n  <code>{escape(r['created_at'][:16])}</code>"
+            )
+        await send_reply(update, 
+            "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=home_keyboard()
+        )
+        return
+
+    if text == "🏆 BXH":
+        with db_connect() as conn:
+            rows = conn.execute(
+                "SELECT user_id,username,full_name,total_earned FROM users WHERE banned=0 ORDER BY total_earned DESC LIMIT 10"
+            ).fetchall()
+        lines = ["<b>🏆 BXH Kiếm Xu</b>", ""]
+        medals = ["🥇", "🥈", "🥉"]
+        for i, r in enumerate(rows, 1):
+            name = f"@{r['username']}" if r["username"] else (r["full_name"] or str(r["user_id"]))
+            if not name.startswith("@"):
+                name = name.title()
+            prefix = medals[i - 1] if i <= 3 else f"{i}."
+            lines.append(f"{prefix} {escape(name)} — <b>{fmt_xu(r['total_earned'])}</b>")
+        if not rows:
+            lines.append("Chưa Có Dữ Liệu.")
+        await send_reply(update, 
+            "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=home_keyboard()
+        )
+        return
+
+    if text == "📖 Hướng Dẫn":
+        guide = escape(get_setting("guide_text", ""))
+        await send_reply(update, 
+            f"<b>📖 Hướng Dẫn</b>\n\n{guide}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=home_keyboard(),
+        )
+        return
+
+    if text == "🕺 Hỗ Trợ / Liên Hệ":
+        support = get_setting("support_url", ENV_SUPPORT_URL)
+        await send_reply(update, 
+            f"<b>🕺 Hỗ Trợ / Liên Hệ</b>\n\nAdmin: {escape(get_setting('admin_username', ENV_ADMIN_USERNAME))}\n{escape(support)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=home_keyboard(),
+            disable_web_page_preview=True,
+        )
+        return
 
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
     if not is_admin(update):
-        await update.message.reply_text("⛔ Bạn không có quyền sử dụng /admin.")
+        await send_reply(update, "⛔ Bạn Không Có Quyền Sử Dụng /admin.")
         return
-    await update.message.reply_text(
-        "<b>🛠 BẢNG QUẢN TRỊ BOT</b>\n\nChọn chức năng cần quản lý:",
+    context.user_data.pop("admin_action", None)
+    await send_reply(
+        update,
+        "<b>🛠 Bảng Quản Trị Bot</b>\n\nChọn Chức Năng Cần Quản Lý:",
         parse_mode=ParseMode.HTML,
-        reply_markup=admin_main_keyboard(),
+        reply_markup=admin_keyboard(),
     )
+
+
+class NativeAdminQuery:
+    """Adapter Để Tái Sử Dụng Toàn Bộ Logic Callback Cho Nút Admin Cố Định."""
+
+    def __init__(self, update: Update, data: str):
+        self.data = data
+        self.message = update.message
+        self.from_user = update.effective_user
+
+    async def answer(self, text=None, *args, **kwargs):
+        # Reply Keyboard Không Có Callback Popup, Nên Chỉ Gửi Cảnh Báo Khi Có Nội Dung.
+        if text:
+            await self.message.reply_text(display_title_case(str(text)), reply_markup=admin_keyboard())
+        return True
+
+    async def edit_message_text(self, text, *args, **kwargs):
+        # Với Reply Keyboard, "Edit" Được Chuyển Thành Một Tin Nhắn Mới.
+        return await self.message.reply_text(display_title_case(text), *args, **kwargs)
+
+
+ADMIN_NATIVE_ACTIONS = {
+    "👥 Người Dùng": "adm:users",
+    "🎯 Nhiệm Vụ": "adm:tasks",
+    "💰 Quản Lý Xu": "adm:coins",
+    "🎁 Quà Tặng": "adm:rewards",
+    "🔑 Key / File": "adm:keys",
+    "📊 Thống Kê": "adm:stats",
+    "📢 Thông Báo": "adm:broadcast",
+    "⚙️ Cài Đặt": "adm:settings",
+    "🛡 Bảo Mật": "adm:security",
+    "🔗 Api Rút Gọn": "adm:shorteners",
+    "📜 Lịch Sử Hệ Thống": "adm:history",
+    "📦 Đơn Đổi Quà": "adm:orders",
+}
+
+
+async def admin_native_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Xử Lý Menu /admin Cố Định Nằm Ngay Trong App Telegram."""
+    ensure_user(update)
+    if not is_admin(update):
+        await send_reply(update, "⛔ Bạn Không Có Quyền Sử Dụng Menu Admin.", reply_markup=home_keyboard())
+        return
+
+    text = (update.message.text or "").strip()
+    context.user_data.pop("admin_action", None)
+
+    if text == "🏠 Menu Người Dùng":
+        await send_reply(
+            update,
+            home_text(update.effective_user.id),
+            parse_mode=ParseMode.HTML,
+            reply_markup=home_keyboard(),
+        )
+        return
+
+    data = ADMIN_NATIVE_ACTIONS.get(text)
+    if not data:
+        return
+
+    native_query = NativeAdminQuery(update, data)
+    fake_update = SimpleNamespace(callback_query=native_query, effective_user=update.effective_user)
+    await admin_callbacks(fake_update, context)
+
+
+USER_NATIVE_BUTTONS = {
+    "👤 Tài Khoản",
+    "🎯 Làm Nhiệm Vụ",
+    "🎁 Đổi Quà",
+    "📜 Lịch Sử",
+    "🏆 BXH",
+    "📖 Hướng Dẫn",
+    "🕺 Hỗ Trợ / Liên Hệ",
+}
+
+
+async def route_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Điều Phối Toàn Bộ Nút Reply Keyboard Và Nội Dung Nhập Admin."""
+    text = (update.message.text or "").strip() if update.message else ""
+
+    # Ưu Tiên Menu Admin Trước, Kể Cả Khi Đang Ở Một Bước Nhập Dữ Liệu.
+    if text in ADMIN_NATIVE_ACTIONS or text == "🏠 Menu Người Dùng":
+        await admin_native_menu_handler(update, context)
+        return
+
+    # Menu Người Dùng.
+    if text in USER_NATIVE_BUTTONS:
+        await native_menu_handler(update, context)
+        return
+
+    # Các Nội Dung Còn Lại Chỉ Được Xử Lý Như Dữ Liệu Admin Khi Đang Có Trạng Thái Nhập.
+    if is_admin(update) and context.user_data.get("admin_action"):
+        await admin_text_input(update, context)
+        return
+
+    # Nếu Admin Gõ Văn Bản Thường Khi Không Có Trạng Thái Nhập, Nhắc Dùng /admin.
+    if is_admin(update):
+        await send_reply(
+            update,
+            "ℹ️ Hãy Chọn Một Chức Năng Trong Menu Quản Trị Hoặc Gửi /admin Để Mở Lại Menu.",
+            reply_markup=admin_keyboard(),
+        )
+
 
 
 async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
-    await update.message.reply_text(f"🆔 Telegram ID của bạn: <code>{update.effective_user.id}</code>", parse_mode=ParseMode.HTML)
+    await send_reply(update, f"🆔 Telegram ID của bạn: <code>{update.effective_user.id}</code>", parse_mode=ParseMode.HTML)
 
 
 def today_start_iso() -> str:
@@ -410,8 +868,102 @@ def get_public_base_url() -> str:
     return get_setting("public_base_url", PUBLIC_BASE_URL).strip().rstrip("/")
 
 
+def _find_short_url(value, target_url: str, fallback_url: str = "") -> str:
+    """Tìm Link Rút Gọn Trong JSON Hoặc Text Mà Không Nhận Nhầm Link Đích."""
+    blocked = {target_url.strip(), fallback_url.strip()} - {""}
+
+    def valid(candidate) -> str:
+        candidate = str(candidate or "").strip().strip('"\' ')
+        if not candidate.startswith(("http://", "https://")):
+            return ""
+        if candidate in blocked:
+            return ""
+        return candidate
+
+    preferred_keys = (
+        "shortenedUrl", "short_url", "shortUrl", "shortlink", "short_link",
+        "url", "link", "result", "data",
+    )
+
+    if isinstance(value, dict):
+        for key in preferred_keys:
+            if key in value:
+                found = _find_short_url(value[key], target_url, fallback_url)
+                if found:
+                    return found
+        for item in value.values():
+            found = _find_short_url(item, target_url, fallback_url)
+            if found:
+                return found
+        return ""
+
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            found = _find_short_url(item, target_url, fallback_url)
+            if found:
+                return found
+        return ""
+
+    text = str(value or "").strip()
+    direct = valid(text)
+    if direct:
+        return direct
+    for candidate in re.findall(r'https?://[^\s"\'<>\\]+', text, flags=re.IGNORECASE):
+        found = valid(candidate)
+        if found:
+            return found
+    return ""
+
+
+async def shorten_trafficvn(target_url: str) -> str:
+    """Gọi TrafficVN Bằng API Key Từ Render Environment."""
+    if not TRAFFICVN_API_KEY:
+        raise RuntimeError("Chưa Cấu Hình TRAFFICVN_API_KEY Trên Render")
+
+    fallback_url = TRAFFICVN_FALLBACK_URL or get_public_base_url() or target_url
+    params = {
+        "api": TRAFFICVN_API_KEY,
+        "url": target_url,
+        "fallback_url": fallback_url,
+    }
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150.0.0.0 Safari/537.36",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(TRAFFICVN_API_URL, params=params, headers=headers, allow_redirects=False) as resp:
+            location = str(resp.headers.get("Location") or "").strip()
+            if 300 <= resp.status < 400 and location.startswith(("http://", "https://")):
+                found = _find_short_url(location, target_url, fallback_url)
+                if found:
+                    return found
+
+            body = await resp.text()
+            if resp.status >= 400:
+                raise RuntimeError(f"TrafficVN Trả Về HTTP {resp.status}")
+
+            parsed = body.strip()
+            try:
+                parsed = json.loads(body)
+            except json.JSONDecodeError:
+                pass
+
+            result = _find_short_url(parsed, target_url, fallback_url)
+            if not result:
+                raise RuntimeError("TrafficVN Không Trả Về Link Rút Gọn Hợp Lệ")
+            return result
+
+
 async def shorten_url(shortener, target_url: str, user_id: int, token: str) -> str:
     template = shortener["api_template"]
+    if template == "trafficvn://env":
+        return await shorten_trafficvn(target_url)
+
     values = {
         "url": target_url,
         "url_encoded": quote(target_url, safe=""),
@@ -481,36 +1033,44 @@ async def task_complete_handler(request: web.Request):
             (token,),
         ).fetchone()
         if not session:
-            return web.Response(text="Liên kết không hợp lệ hoặc đã hết hạn.", content_type="text/html", status=404)
+            return web.Response(text="Liên Kết Không Hợp Lệ Hoặc Đã Hết Hạn.", content_type="text/html", status=404)
+
         created = datetime.fromisoformat(session["created_at"])
         expire_minutes = int(get_setting("session_expire_minutes", "60") or 60)
         if datetime.now() > created + timedelta(minutes=expire_minutes):
-            return web.Response(text="Phiên nhiệm vụ đã hết hạn. Hãy quay lại bot lấy link mới.", content_type="text/html", status=410)
+            return web.Response(text="Phiên Nhiệm Vụ Đã Hết Hạn. Hãy Quay Lại Bot Lấy Link Mới.", content_type="text/html", status=410)
+
         if (datetime.now() - created).total_seconds() < session["min_seconds"]:
             remain = int(session["min_seconds"] - (datetime.now() - created).total_seconds()) + 1
-            return web.Response(text=f"Bạn quay lại quá sớm. Vui lòng chờ thêm khoảng {remain} giây.", content_type="text/html", status=429)
-        if session["status"] == "claimed":
-            msg = "Phiên này đã nhận xu trước đó."
-        else:
+            return web.Response(text=f"Bạn Quay Lại Quá Sớm. Vui Lòng Chờ Thêm Khoảng {remain} Giây.", content_type="text/html", status=429)
+
+        if session["status"] != "claimed":
             ip = request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote or ""
             max_ip = int(get_setting("max_claims_per_ip_day", "10") or 10)
-            if max_ip > 0 and ip:
+            if max_ip > 0 and ip and session["status"] == "pending":
                 c = conn.execute(
                     "SELECT COUNT(*) AS c FROM task_sessions WHERE ip=? AND status IN ('completed','claimed') AND completed_at>=?",
                     (ip, today_start_iso()),
                 ).fetchone()["c"]
                 if c >= max_ip:
-                    return web.Response(text="Thiết bị/IP này đã vượt giới hạn xác nhận hôm nay.", content_type="text/html", status=429)
+                    return web.Response(text="Thiết Bị/IP Này Đã Vượt Giới Hạn Xác Nhận Hôm Nay.", content_type="text/html", status=429)
+
             conn.execute(
-                "UPDATE task_sessions SET status='completed', completed_at=?, ip=? WHERE token=? AND status='pending'",
+                "UPDATE task_sessions SET status='completed', completed_at=COALESCE(completed_at, ?), ip=CASE WHEN ip IS NULL OR ip='' THEN ? ELSE ip END WHERE token=? AND status='pending'",
                 (now_iso(), ip, token),
             )
             conn.commit()
-            msg = "Xác nhận thành công. Hãy quay lại Telegram và bấm ‘Kiểm tra & Nhận xu’."
-    back = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else "https://t.me/"
-    html = f"""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Hoàn thành</title>
-<style>body{{font-family:Arial,sans-serif;background:#0f172a;color:#fff;display:grid;place-items:center;min-height:100vh;margin:0}}.card{{max-width:560px;background:#111827;padding:28px;border-radius:18px;text-align:center}}a{{display:inline-block;margin-top:18px;padding:12px 18px;background:#229ED9;color:#fff;text-decoration:none;border-radius:12px}}</style></head><body><div class='card'><h2>✅ Hoàn thành nhiệm vụ</h2><p>{escape(msg)}</p><a href='{escape(back)}'>Quay lại Telegram</a></div></body></html>"""
-    return web.Response(text=html, content_type="text/html")
+
+    # Trang Đích Sau Khi Vượt Link Sẽ Chuyển Thẳng Sang Deep Link Của Telegram.
+    # Telegram Nhận: /start claim_TOKEN Và Bot Tự Kiểm Tra + Cộng Xu Một Lần.
+    if BOT_USERNAME:
+        deep_link = f"https://t.me/{BOT_USERNAME}?start=claim_{token}"
+        raise web.HTTPFound(location=deep_link)
+
+    return web.Response(
+        text="✅ Xác Nhận Thành Công. Vui Lòng Quay Lại Telegram Để Nhận Xu.",
+        content_type="text/html",
+    )
 
 
 async def health_handler(request: web.Request):
@@ -545,20 +1105,20 @@ async def stop_http_server(app: Application):
 
 async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await answer_query(query, )
     ensure_user(update)
     uid = update.effective_user.id
     data = query.data
 
     if is_banned(uid) and not is_admin(update):
-        await query.answer("Tài khoản đã bị khóa.", show_alert=True)
+        await answer_query(query, "Tài khoản đã bị khóa.", show_alert=True)
         return
     if get_setting("maintenance", "0") == "1" and not is_admin(update) and data != "home":
-        await query.answer("Bot đang bảo trì.", show_alert=True)
+        await answer_query(query, "Bot đang bảo trì.", show_alert=True)
         return
 
     if data == "home":
-        await safe_edit(query, home_text(uid), home_keyboard())
+        await safe_edit(query, home_text(uid), InlineKeyboardMarkup([]))
         return
 
     if data == "account":
@@ -597,10 +1157,10 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with db_connect() as conn:
             task = conn.execute("SELECT * FROM tasks WHERE id=? AND active=1", (task_id,)).fetchone()
             if not task:
-                await query.answer("Nhiệm vụ không tồn tại hoặc đã tắt.", show_alert=True)
+                await answer_query(query, "Nhiệm vụ không tồn tại hoặc đã tắt.", show_alert=True)
                 return
             if claimed_today(conn, uid, task_id) >= task["daily_limit"]:
-                await query.answer("Bạn đã hết lượt nhiệm vụ này hôm nay.", show_alert=True)
+                await answer_query(query, "Bạn đã hết lượt nhiệm vụ này hôm nay.", show_alert=True)
                 return
             old = conn.execute(
                 "SELECT * FROM task_sessions WHERE user_id=? AND task_id=? AND status IN ('pending','completed') ORDER BY created_at DESC LIMIT 1",
@@ -618,53 +1178,48 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             link = await build_task_link(task, uid, token)
         except Exception as e:
-            await query.answer("Không tạo được link nhiệm vụ. Admin cần kiểm tra API rút gọn.", show_alert=True)
+            await answer_query(query, "Không tạo được link nhiệm vụ. Admin cần kiểm tra API rút gọn.", show_alert=True)
             if is_admin(update):
                 print("Shortener error:", repr(e))
             return
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔗 Vượt Link Lấy Xu", url=link)],
-            [InlineKeyboardButton("✅ Kiểm tra & Nhận xu", callback_data=f"task:claim:{token}")],
-            [InlineKeyboardButton("⬅️ Danh sách nhiệm vụ", callback_data="tasks")],
+            [InlineKeyboardButton("✅ Kiểm Tra Thủ Công", callback_data=f"task:claim:{token}")],
+            [InlineKeyboardButton("⬅️ Danh Sách Nhiệm Vụ", callback_data="tasks")],
         ])
         await safe_edit(
             query,
-            f"<b>🎯 {escape(task['name'])}</b>\n\n💰 Thưởng: <b>+{fmt_xu(task['reward'])}</b>\n⏱ Thời gian tối thiểu: <b>{task['min_seconds']} giây</b>\n\n1. Bấm <b>Vượt Link Lấy Xu</b>.\n2. Hoàn thành link đến trang xác nhận.\n3. Quay lại đây bấm <b>Kiểm tra & Nhận xu</b>.",
+            f"<b>🎯 {escape(task['name'])}</b>\n\n💰 Thưởng: <b>+{fmt_xu(task['reward'])}</b>\n⏱ Thời Gian Tối Thiểu: <b>{task['min_seconds']} Giây</b>\n\n1. Bấm <b>Vượt Link Lấy Xu</b>.\n2. Hoàn Thành Toàn Bộ Link.\n3. Trang Cuối Sẽ Tự Mở Telegram Bằng Link <code>?start=claim_...</code>.\n4. Nhấn <b>Start</b> Nếu Telegram Yêu Cầu. Bot Sẽ Tự Kiểm Tra Và Cộng Xu.\n\nNếu Telegram Không Tự Mở, Bạn Có Thể Quay Lại Và Bấm <b>Kiểm Tra Thủ Công</b>.",
             kb,
         )
         return
 
     if data.startswith("task:claim:"):
         token = data.split(":", 2)[2]
-        with db_connect() as conn:
-            row = conn.execute(
-                "SELECT s.*,t.name,t.reward,t.daily_limit FROM task_sessions s JOIN tasks t ON t.id=s.task_id WHERE s.token=?",
-                (token,),
-            ).fetchone()
-            if not row or row["user_id"] != uid:
-                await query.answer("Phiên nhiệm vụ không hợp lệ.", show_alert=True)
-                return
-            if row["status"] == "claimed":
-                await query.answer("Phiên này đã nhận xu rồi.", show_alert=True)
-                return
-            if row["status"] != "completed":
-                await query.answer("Chưa xác nhận hoàn thành. Hãy vượt link đến trang cuối trước.", show_alert=True)
-                return
-            if claimed_today(conn, uid, row["task_id"]) >= row["daily_limit"]:
-                await query.answer("Bạn đã đạt giới hạn hôm nay.", show_alert=True)
-                return
-            cur = conn.execute("UPDATE task_sessions SET status='claimed', claimed_at=? WHERE token=? AND status='completed'", (now_iso(), token))
-            if cur.rowcount != 1:
-                await query.answer("Phiên đã được xử lý.", show_alert=True)
-                return
-            conn.execute("UPDATE users SET coins=coins+?, total_earned=total_earned+? WHERE user_id=?", (row["reward"], row["reward"], uid))
-            conn.execute(
-                "INSERT INTO transactions(user_id,type,amount,note,created_at) VALUES (?,?,?,?,?)",
-                (uid, "task_reward", row["reward"], f"Nhiệm vụ: {row['name']}", now_iso()),
-            )
-            conn.commit()
-        await query.answer(f"Đã cộng +{fmt_num(row['reward'])} Xu!", show_alert=True)
-        await safe_edit(query, f"✅ <b>HOÀN THÀNH</b>\n\nBạn nhận được <b>+{fmt_xu(row['reward'])}</b> từ nhiệm vụ <b>{escape(row['name'])}</b>.", back_home())
+        status, row, balance = claim_task_session(uid, token)
+
+        if status == "invalid":
+            await answer_query(query, "Phiên Nhiệm Vụ Không Hợp Lệ.", show_alert=True)
+            return
+        if status == "already":
+            await answer_query(query, "Phiên Này Đã Nhận Xu Rồi.", show_alert=True)
+            return
+        if status == "not_completed":
+            await answer_query(query, "Chưa Xác Nhận Hoàn Thành. Hãy Vượt Link Đến Trang Cuối Trước.", show_alert=True)
+            return
+        if status == "limit":
+            await answer_query(query, "Bạn Đã Đạt Giới Hạn Hôm Nay.", show_alert=True)
+            return
+        if status == "processed":
+            await answer_query(query, "Phiên Đã Được Xử Lý.", show_alert=True)
+            return
+
+        await answer_query(query, f"Đã Cộng +{fmt_num(row['reward'])} Xu!", show_alert=True)
+        await safe_edit(
+            query,
+            f"✅ <b>Hoàn Thành</b>\n\nBạn Nhận Được <b>+{fmt_xu(row['reward'])}</b> Từ Nhiệm Vụ <b>{escape(row['name'])}</b>.\n💳 Số Dư Hiện Tại: <b>{fmt_xu(balance)}</b>.",
+            back_home(),
+        )
         return
 
     if data == "rewards":
@@ -692,7 +1247,7 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with db_connect() as conn:
             r = conn.execute("SELECT * FROM rewards WHERE id=? AND active=1", (rid,)).fetchone()
             if not r:
-                await query.answer("Quà không tồn tại.", show_alert=True)
+                await answer_query(query, "Quà không tồn tại.", show_alert=True)
                 return
             if r["delivery_type"] == "keypool":
                 stock = conn.execute("SELECT COUNT(*) AS c FROM reward_keys WHERE reward_id=? AND used=0", (rid,)).fetchone()["c"]
@@ -716,19 +1271,19 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             r = conn.execute("SELECT * FROM rewards WHERE id=? AND active=1", (rid,)).fetchone()
             u = conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
             if not r:
-                conn.rollback(); await query.answer("Quà không tồn tại.", show_alert=True); return
+                conn.rollback(); await answer_query(query, "Quà không tồn tại.", show_alert=True); return
             if u["coins"] < r["price"]:
-                conn.rollback(); await query.answer("Bạn không đủ xu.", show_alert=True); return
+                conn.rollback(); await answer_query(query, "Bạn không đủ xu.", show_alert=True); return
             delivery_type = r["delivery_type"]
             if delivery_type == "keypool":
                 keyrow = conn.execute("SELECT * FROM reward_keys WHERE reward_id=? AND used=0 ORDER BY id LIMIT 1", (rid,)).fetchone()
                 if not keyrow:
-                    conn.rollback(); await query.answer("Quà đã hết key.", show_alert=True); return
+                    conn.rollback(); await answer_query(query, "Quà đã hết key.", show_alert=True); return
                 delivery = keyrow["value"]
                 conn.execute("UPDATE reward_keys SET used=1,user_id=?,used_at=? WHERE id=? AND used=0", (uid, now_iso(), keyrow["id"]))
             else:
                 if r["stock"] == 0:
-                    conn.rollback(); await query.answer("Quà đã hết hàng.", show_alert=True); return
+                    conn.rollback(); await answer_query(query, "Quà đã hết hàng.", show_alert=True); return
                 if r["stock"] > 0:
                     conn.execute("UPDATE rewards SET stock=stock-1 WHERE id=?", (rid,))
                 delivery = r["delivery_value"] or ""
@@ -743,19 +1298,19 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.commit()
         if delivery_type == "file_id" and delivery:
             try:
-                await context.bot.send_document(chat_id=uid, document=delivery, caption=f"✅ Quà: {r['name']}")
+                await context.bot.send_document(chat_id=uid, document=delivery, caption=display_title_case(f"✅ Quà: {r['name']}"))
             except Exception:
-                await context.bot.send_message(chat_id=uid, text="✅ Đổi quà thành công nhưng gửi file lỗi. Admin sẽ kiểm tra đơn của bạn.")
+                await send_bot_message(context, chat_id=uid, text="✅ Đổi quà thành công nhưng gửi file lỗi. Admin sẽ kiểm tra đơn của bạn.")
         elif delivery_type in ("text", "keypool") and delivery:
-            await context.bot.send_message(chat_id=uid, text=f"✅ {r['name']}\n\n{delivery}")
+            await send_bot_message(context, chat_id=uid, text=f"✅ {r['name']}\n\n{delivery}")
         elif delivery_type == "manual":
             admin_id = int(get_setting("admin_id", "0") or 0)
             if admin_id:
                 try:
-                    await context.bot.send_message(admin_id, f"📦 Có đơn thủ công mới #{order_id}\nUser: {uid}\nQuà: {r['name']}\nGiá: {fmt_xu(r['price'])}")
+                    await send_bot_message(context, admin_id, f"📦 Có đơn thủ công mới #{order_id}\nUser: {uid}\nQuà: {r['name']}\nGiá: {fmt_xu(r['price'])}")
                 except Exception:
                     pass
-        await query.answer("Đổi quà thành công!", show_alert=True)
+        await answer_query(query, "Đổi quà thành công!", show_alert=True)
         msg = f"✅ <b>ĐỔI QUÀ THÀNH CÔNG</b>\n\n🎁 {escape(r['name'])}\n💰 Đã trừ: <b>{fmt_xu(r['price'])}</b>"
         if delivery_type == "manual":
             msg += f"\n📦 Mã đơn: <code>#{order_id}</code>\nAdmin sẽ xử lý đơn này."
@@ -798,17 +1353,22 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await answer_query(query, )
     ensure_user(update)
     if not is_admin(update):
-        await query.answer("Không có quyền admin.", show_alert=True)
+        await answer_query(query, "Không có quyền admin.", show_alert=True)
         return
     data = query.data
     aid = update.effective_user.id
 
     if data == "adm:main":
         context.user_data.pop("admin_action", None)
-        await safe_edit(query, "<b>🛠 BẢNG QUẢN TRỊ BOT</b>\n\nChọn chức năng cần quản lý:", admin_main_keyboard())
+        if getattr(query, "message", None):
+            await query.message.reply_text(
+                display_title_case("<b>🛠 Bảng Quản Trị Bot</b>\n\nChọn Chức Năng Cần Quản Lý:"),
+                parse_mode=ParseMode.HTML,
+                reply_markup=admin_keyboard(),
+            )
         return
 
     if data == "adm:users":
@@ -856,7 +1416,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with db_connect() as conn:
             conn.execute("DELETE FROM task_sessions WHERE user_id=? AND status!='claimed'", (target,)); conn.commit()
         log_admin(aid,"reset_sessions",str(target))
-        await query.answer("Đã reset phiên nhiệm vụ chưa nhận xu.", show_alert=True)
+        await answer_query(query, "Đã reset phiên nhiệm vụ chưa nhận xu.", show_alert=True)
         await show_admin_user(query,target)
         return
 
@@ -902,7 +1462,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tid=int(data.rsplit(":",1)[1])
         with db_connect() as conn:
             conn.execute("UPDATE tasks SET active=0 WHERE id=?",(tid,)); conn.commit()
-        log_admin(aid,"disable_task",str(tid)); await query.answer("Đã tắt nhiệm vụ.",show_alert=True); await show_admin_task(query,tid); return
+        log_admin(aid,"disable_task",str(tid)); await answer_query(query, "Đã tắt nhiệm vụ.",show_alert=True); await show_admin_task(query,tid); return
 
     if data.startswith("adm:task:edit:"):
         tid=int(data.rsplit(":",1)[1])
@@ -939,7 +1499,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rid=int(data.rsplit(":",1)[1])
         with db_connect() as conn:
             conn.execute("UPDATE rewards SET active=0 WHERE id=?",(rid,)); conn.commit()
-        log_admin(aid,"disable_reward",str(rid)); await query.answer("Đã ẩn quà.",show_alert=True); await show_admin_reward(query,rid); return
+        log_admin(aid,"disable_reward",str(rid)); await answer_query(query, "Đã ẩn quà.",show_alert=True); await show_admin_reward(query,rid); return
 
     if data.startswith("adm:reward:edit:"):
         rid=int(data.rsplit(":",1)[1])
@@ -1031,14 +1591,14 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "adm:broadcast:confirm":
         text=context.user_data.pop("broadcast_text","")
         if not text:
-            await query.answer("Không còn nội dung để gửi.",show_alert=True); return
+            await answer_query(query, "Không còn nội dung để gửi.",show_alert=True); return
         with db_connect() as conn:
             ids=[r["user_id"] for r in conn.execute("SELECT user_id FROM users WHERE banned=0").fetchall()]
         ok=fail=0
         await safe_edit(query,f"⏳ Đang gửi tới {len(ids)} user...",admin_back())
         for i,target in enumerate(ids,1):
             try:
-                await context.bot.send_message(target,text)
+                await send_bot_message(context, target,text)
                 ok+=1
             except (Forbidden,BadRequest): fail+=1
             except Exception: fail+=1
@@ -1066,7 +1626,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "adm:maintenance":
         new="0" if get_setting("maintenance","0")=="1" else "1"; set_setting("maintenance",new); log_admin(aid,"maintenance",new)
-        await query.answer("Đã đổi trạng thái bảo trì.",show_alert=True)
+        await answer_query(query, "Đã đổi trạng thái bảo trì.",show_alert=True)
         # redraw via duplicated settings block trigger by callback value update
         maint="BẬT" if new=="1" else "TẮT"
         kb=InlineKeyboardMarkup([
@@ -1095,7 +1655,7 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "adm:toggle_direct":
         new="0" if get_setting("allow_direct_task","0")=="1" else "1"; set_setting("allow_direct_task",new); log_admin(aid,"allow_direct_task",new)
-        await query.answer("Đã thay đổi. Nên để TẮT khi chạy thật.",show_alert=True)
+        await answer_query(query, "Đã thay đổi. Nên để TẮT khi chạy thật.",show_alert=True)
         direct="BẬT" if new=="1" else "TẮT"
         kb=InlineKeyboardMarkup([[InlineKeyboardButton(f"⚠️ Link trực tiếp: {direct}",callback_data="adm:toggle_direct")],[InlineKeyboardButton("⬅️ Bảo mật",callback_data="adm:security")]])
         await safe_edit(query,f"<b>🛡 LINK TRỰC TIẾP</b>\n\nTrạng thái: <b>{direct}</b>\n\nKhi TẮT, bot bắt buộc phải tạo link qua API rút gọn.",kb); return
@@ -1228,25 +1788,25 @@ async def show_admin_order(query,oid:int):
 async def approve_order(query,context,oid:int,aid:int):
     with db_connect() as conn:
         o=conn.execute("SELECT * FROM orders WHERE id=?",(oid,)).fetchone()
-        if not o or o["status"]!="pending": await query.answer("Đơn không ở trạng thái chờ.",show_alert=True); return
+        if not o or o["status"]!="pending": await answer_query(query, "Đơn không ở trạng thái chờ.",show_alert=True); return
         conn.execute("UPDATE orders SET status='completed',updated_at=? WHERE id=?",(now_iso(),oid)); conn.commit()
-    try: await context.bot.send_message(o["user_id"],f"✅ Đơn #{oid} ({o['reward_name']}) đã được admin duyệt.")
+    try: await send_bot_message(context, o["user_id"],f"✅ Đơn #{oid} ({o['reward_name']}) đã được admin duyệt.")
     except Exception: pass
-    log_admin(aid,"approve_order",str(oid)); await query.answer("Đã duyệt.",show_alert=True); await show_admin_order(query,oid)
+    log_admin(aid,"approve_order",str(oid)); await answer_query(query, "Đã duyệt.",show_alert=True); await show_admin_order(query,oid)
 
 
 async def reject_order(query,context,oid:int,aid:int):
     with db_connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         o=conn.execute("SELECT * FROM orders WHERE id=?",(oid,)).fetchone()
-        if not o or o["status"]!="pending": conn.rollback(); await query.answer("Đơn không ở trạng thái chờ.",show_alert=True); return
+        if not o or o["status"]!="pending": conn.rollback(); await answer_query(query, "Đơn không ở trạng thái chờ.",show_alert=True); return
         conn.execute("UPDATE orders SET status='rejected',updated_at=? WHERE id=?",(now_iso(),oid))
         conn.execute("UPDATE users SET coins=coins+?, total_spent=MAX(0,total_spent-?) WHERE user_id=?",(o["price"],o["price"],o["user_id"]))
         conn.execute("INSERT INTO transactions(user_id,type,amount,note,created_at) VALUES (?,?,?,?,?)",(o["user_id"],"refund",o["price"],f"Hoàn xu đơn #{oid}",now_iso()))
         conn.commit()
-    try: await context.bot.send_message(o["user_id"],f"❌ Đơn #{oid} đã bị từ chối. Bot đã hoàn {fmt_xu(o['price'])}.")
+    try: await send_bot_message(context, o["user_id"],f"❌ Đơn #{oid} đã bị từ chối. Bot đã hoàn {fmt_xu(o['price'])}.")
     except Exception: pass
-    log_admin(aid,"reject_order",str(oid)); await query.answer("Đã từ chối và hoàn xu.",show_alert=True); await show_admin_order(query,oid)
+    log_admin(aid,"reject_order",str(oid)); await answer_query(query, "Đã từ chối và hoàn xu.",show_alert=True); await show_admin_order(query,oid)
 
 
 async def show_shortener(query,sid:int):
@@ -1257,7 +1817,10 @@ async def show_shortener(query,sid:int):
     st="🟢 Bật" if s["active"] else "🔴 Tắt"
     # Hide likely secrets in displayed URL.
     tpl=s["api_template"]
-    shown=tpl[:90]+("…" if len(tpl)>90 else "")
+    if tpl == "trafficvn://env":
+        shown = "TrafficVN • API Key Lưu Trong Render Environment"
+    else:
+        shown=tpl[:90]+("…" if len(tpl)>90 else "")
     kb=InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Bật/Tắt",callback_data=f"adm:shortener:toggle:{sid}"),InlineKeyboardButton("🗑 Tắt API",callback_data=f"adm:shortener:delete:{sid}")],
         [InlineKeyboardButton("⬅️ API rút gọn",callback_data="adm:shorteners")],
@@ -1278,10 +1841,10 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             target=int(text); context.user_data.pop("admin_action",None)
             # Cannot edit a command message; send a fresh card.
             with db_connect() as conn: u=conn.execute("SELECT * FROM users WHERE user_id=?",(target,)).fetchone()
-            if not u: await update.message.reply_text("Không tìm thấy user."); return
+            if not u: await send_reply(update, "Không tìm thấy user."); return
             status="🚫 Đã khóa" if u["banned"] else "🟢 Hoạt động"
             kb=InlineKeyboardMarkup([[InlineKeyboardButton("Xem / quản lý",callback_data=f"adm:user:show:{target}")],[InlineKeyboardButton("⬅️ Admin",callback_data="adm:main")]])
-            await update.message.reply_text(f"👤 User <code>{target}</code>\n@{escape(u['username'] or '-')}\nSố dư: <b>{fmt_xu(u['coins'])}</b>\n{status}",parse_mode=ParseMode.HTML,reply_markup=kb); return
+            await send_reply(update, f"👤 User <code>{target}</code>\n@{escape(u['username'] or '-')}\nSố dư: <b>{fmt_xu(u['coins'])}</b>\n{status}",parse_mode=ParseMode.HTML,reply_markup=kb); return
 
         if action in ("addcoins","subcoins"):
             parts=[p.strip() for p in text.split("|")]
@@ -1296,7 +1859,7 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 conn.execute("UPDATE users SET coins=coins+? WHERE user_id=?",(delta,target))
                 conn.execute("INSERT INTO transactions(user_id,type,amount,note,created_at) VALUES (?,?,?,?,?)",(target,"admin_adjust",delta,note,now_iso())); conn.commit()
             log_admin(aid,action,f"{target}:{delta}:{note}"); context.user_data.pop("admin_action",None)
-            await update.message.reply_text(f"✅ Đã {'cộng' if delta>0 else 'trừ'} {fmt_xu(amount)} {'cho' if delta>0 else 'của'} {target}.",reply_markup=admin_main_keyboard()); return
+            await send_reply(update, f"✅ Đã {'cộng' if delta>0 else 'trừ'} {fmt_xu(amount)} {'cho' if delta>0 else 'của'} {target}.",reply_markup=admin_main_keyboard()); return
 
         if action=="giftall":
             amount=abs(int(text));
@@ -1306,7 +1869,7 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 conn.execute("UPDATE users SET coins=coins+? WHERE banned=0",(amount,))
                 conn.executemany("INSERT INTO transactions(user_id,type,amount,note,created_at) VALUES (?,?,?,?,?)",[(u["user_id"],"gift_all",amount,"Quà toàn hệ thống",now_iso()) for u in users]); conn.commit()
             log_admin(aid,"gift_all",f"{amount} x {len(users)}"); context.user_data.pop("admin_action",None)
-            await update.message.reply_text(f"✅ Đã tặng {fmt_xu(amount)} cho {len(users)} user.",reply_markup=admin_main_keyboard()); return
+            await send_reply(update, f"✅ Đã tặng {fmt_xu(amount)} cho {len(users)} user.",reply_markup=admin_main_keyboard()); return
 
         if action in {"task_add","task_edit"}:
             p=[x.strip() for x in text.split("|")]
@@ -1323,7 +1886,7 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     conn.execute("UPDATE tasks SET name=?,reward=?,daily_limit=?,min_seconds=?,shortener_id=? WHERE id=?",(name,reward,daily,wait,sid,tid))
                 conn.commit()
             log_admin(aid,"add_task" if action=="task_add" else "edit_task",str(tid)); context.user_data.pop("admin_action",None); context.user_data.pop("edit_id",None)
-            await update.message.reply_text(f"✅ Đã {'thêm' if action=='task_add' else 'cập nhật'} nhiệm vụ #{tid}: {name}",reply_markup=admin_main_keyboard()); return
+            await send_reply(update, f"✅ Đã {'thêm' if action=='task_add' else 'cập nhật'} nhiệm vụ #{tid}: {name}",reply_markup=admin_main_keyboard()); return
 
         if action in {"reward_add","reward_edit"}:
             p=[x.strip() for x in text.split("|",4)]
@@ -1343,7 +1906,7 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     conn.execute("UPDATE rewards SET name=?,price=?,stock=?,delivery_type=?,delivery_value=? WHERE id=?",(name,price,stock,typ,value,rid))
                 conn.commit()
             log_admin(aid,"add_reward" if action=="reward_add" else "edit_reward",str(rid)); context.user_data.pop("admin_action",None); context.user_data.pop("edit_id",None)
-            await update.message.reply_text(f"✅ Đã {'thêm' if action=='reward_add' else 'cập nhật'} quà #{rid}: {name}",reply_markup=admin_main_keyboard()); return
+            await send_reply(update, f"✅ Đã {'thêm' if action=='reward_add' else 'cập nhật'} quà #{rid}: {name}",reply_markup=admin_main_keyboard()); return
 
         if action=="key_reward":
             rid=int(text)
@@ -1352,14 +1915,14 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not r: raise ValueError("Không tìm thấy quà")
                 conn.execute("UPDATE rewards SET delivery_type='keypool' WHERE id=?",(rid,)); conn.commit()
             context.user_data["admin_action"]="key_file"; context.user_data["reward_id"]=rid
-            await update.message.reply_text(f"📄 Bây giờ gửi file <b>.txt</b> chứa key cho quà #{rid}. Mỗi dòng 1 key.",parse_mode=ParseMode.HTML); return
+            await send_reply(update, f"📄 Bây giờ gửi file <b>.txt</b> chứa key cho quà #{rid}. Mỗi dòng 1 key.",parse_mode=ParseMode.HTML); return
 
         if action=="file_reward":
             rid=int(text)
             with db_connect() as conn:
                 if not conn.execute("SELECT 1 FROM rewards WHERE id=?",(rid,)).fetchone(): raise ValueError("Không tìm thấy quà")
             context.user_data["admin_action"]="telegram_file"; context.user_data["reward_id"]=rid
-            await update.message.reply_text(f"📁 Bây giờ gửi file cần giao cho user đối với quà #{rid}."); return
+            await send_reply(update, f"📁 Bây giờ gửi file cần giao cho user đối với quà #{rid}."); return
 
         if action=="clear_keys":
             rid=int(text)
@@ -1368,12 +1931,12 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not r: raise ValueError("Không tìm thấy quà")
                 cur=conn.execute("DELETE FROM reward_keys WHERE reward_id=? AND used=0",(rid,)); deleted=cur.rowcount; conn.commit()
             log_admin(aid,"clear_unused_keys",f"reward={rid},deleted={deleted}"); context.user_data.pop("admin_action",None)
-            await update.message.reply_text(f"✅ Đã xóa {deleted} key chưa dùng của quà #{rid}.",reply_markup=admin_main_keyboard()); return
+            await send_reply(update, f"✅ Đã xóa {deleted} key chưa dùng của quà #{rid}.",reply_markup=admin_main_keyboard()); return
 
         if action=="broadcast":
             context.user_data.pop("admin_action",None); context.user_data["broadcast_text"]=text
             kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Gửi tất cả",callback_data="adm:broadcast:confirm"),InlineKeyboardButton("❌ Hủy",callback_data="adm:broadcast:cancel")]])
-            await update.message.reply_text(f"<b>📢 XEM TRƯỚC</b>\n\n{escape(text)}",parse_mode=ParseMode.HTML,reply_markup=kb); return
+            await send_reply(update, f"<b>📢 XEM TRƯỚC</b>\n\n{escape(text)}",parse_mode=ParseMode.HTML,reply_markup=kb); return
 
         if action in {"set_public_url","set_channel","set_support","set_guide","set_ip_limit","set_expire"}:
             mapping={"set_public_url":"public_base_url","set_channel":"channel_username","set_support":"support_url","set_guide":"guide_text","set_ip_limit":"max_claims_per_ip_day","set_expire":"session_expire_minutes"}
@@ -1386,7 +1949,7 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if n<0 or (action=="set_expire" and n<1): raise ValueError("Giá trị không hợp lệ")
                 val=str(n)
             set_setting(key,val); log_admin(aid,action,val[:100]); context.user_data.pop("admin_action",None)
-            await update.message.reply_text("✅ Đã cập nhật cài đặt.",reply_markup=admin_main_keyboard()); return
+            await send_reply(update, "✅ Đã cập nhật cài đặt.",reply_markup=admin_main_keyboard()); return
 
         if action=="shortener_add":
             p=[x.strip() for x in text.split("|",2)]
@@ -1396,10 +1959,10 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with db_connect() as conn:
                 cur=conn.execute("INSERT INTO shorteners(name,api_template,response_key,created_at) VALUES (?,?,?,?)",(name,template,response_key,now_iso())); conn.commit(); sid=cur.lastrowid
             log_admin(aid,"add_shortener",str(sid)); context.user_data.pop("admin_action",None)
-            await update.message.reply_text(f"✅ Đã thêm API rút gọn #{sid}: {name}",reply_markup=admin_main_keyboard()); return
+            await send_reply(update, f"✅ Đã thêm API rút gọn #{sid}: {name}",reply_markup=admin_main_keyboard()); return
 
     except Exception as e:
-        await update.message.reply_text(f"❌ Dữ liệu không hợp lệ: {escape(str(e))}\n\nGửi lại đúng định dạng hoặc bấm /admin để hủy.",parse_mode=ParseMode.HTML)
+        await send_reply(update, f"❌ Dữ liệu không hợp lệ: {escape(str(e))}\n\nGửi lại đúng định dạng hoặc bấm /admin để hủy.",parse_mode=ParseMode.HTML)
 
 
 async def admin_document_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1413,11 +1976,11 @@ async def admin_document_input(update: Update, context: ContextTypes.DEFAULT_TYP
         with db_connect() as conn:
             conn.execute("UPDATE rewards SET delivery_type='file_id',delivery_value=? WHERE id=?",(doc.file_id,rid)); conn.commit()
         log_admin(update.effective_user.id,"assign_file",str(rid)); context.user_data.pop("admin_action",None); context.user_data.pop("reward_id",None)
-        await update.message.reply_text(f"✅ Đã gán file Telegram cho quà #{rid}. Bot sẽ tự gửi file này khi user đổi quà.",reply_markup=admin_main_keyboard()); return
+        await send_reply(update, f"✅ Đã gán file Telegram cho quà #{rid}. Bot sẽ tự gửi file này khi user đổi quà.",reply_markup=admin_main_keyboard()); return
     if not (doc.file_name or "").lower().endswith(".txt"):
-        await update.message.reply_text("❌ Hãy gửi file .txt, mỗi dòng 1 key."); return
+        await send_reply(update, "❌ Hãy gửi file .txt, mỗi dòng 1 key."); return
     if doc.file_size and doc.file_size>2_000_000:
-        await update.message.reply_text("❌ File key quá lớn. Giới hạn 2 MB."); return
+        await send_reply(update, "❌ File key quá lớn. Giới hạn 2 MB."); return
     tgfile=await context.bot.get_file(doc.file_id)
     data=await tgfile.download_as_bytearray()
     text=bytes(data).decode("utf-8-sig",errors="ignore")
@@ -1427,21 +1990,21 @@ async def admin_document_input(update: Update, context: ContextTypes.DEFAULT_TYP
         if key and key not in seen:
             seen.add(key); keys.append(key)
     if not keys:
-        await update.message.reply_text("❌ File không có key hợp lệ."); return
+        await send_reply(update, "❌ File không có key hợp lệ."); return
     added=0
     with db_connect() as conn:
         for key in keys:
             cur=conn.execute("INSERT OR IGNORE INTO reward_keys(reward_id,value) VALUES (?,?)",(rid,key)); added+=cur.rowcount
         conn.execute("UPDATE rewards SET delivery_type='keypool' WHERE id=?",(rid,)); conn.commit()
     log_admin(update.effective_user.id,"upload_keys",f"reward={rid},added={added}"); context.user_data.pop("admin_action",None); context.user_data.pop("reward_id",None)
-    await update.message.reply_text(f"✅ Đã nhập {added}/{len(keys)} key mới cho quà #{rid}.",reply_markup=admin_main_keyboard())
+    await send_reply(update, f"✅ Đã nhập {added}/{len(keys)} key mới cho quà #{rid}.",reply_markup=admin_main_keyboard())
 
 
 async def addxu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(update)
     if not is_admin(update): return
     if len(context.args) < 2:
-        await update.message.reply_text("Dùng: /addxu USER_ID SO_XU [ghi chú]")
+        await send_reply(update, "Dùng: /addxu USER_ID SO_XU [ghi chú]")
         return
     try:
         target=int(context.args[0]); amount=abs(int(context.args[1])); note=" ".join(context.args[2:]) or "Admin cộng xu"
@@ -1450,14 +2013,14 @@ async def addxu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.execute("UPDATE users SET coins=coins+? WHERE user_id=?",(amount,target))
             conn.execute("INSERT INTO transactions(user_id,type,amount,note,created_at) VALUES (?,?,?,?,?)",(target,"admin_adjust",amount,note,now_iso())); conn.commit()
         log_admin(update.effective_user.id,"addxu_command",f"{target}:{amount}")
-        await update.message.reply_text(f"✅ Đã cộng {fmt_xu(amount)} cho {target}.")
+        await send_reply(update, f"✅ Đã cộng {fmt_xu(amount)} cho {target}.")
     except ValueError:
-        await update.message.reply_text("USER_ID và SO_XU phải là số.")
+        await send_reply(update, "USER_ID và SO_XU phải là số.")
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("admin_action",None); context.user_data.pop("reward_id",None); context.user_data.pop("broadcast_text",None)
-    await update.message.reply_text("Đã hủy thao tác.")
+    await send_reply(update, "Đã hủy thao tác.")
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -1478,9 +2041,11 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_callbacks,pattern=r"^adm:"))
     app.add_handler(CallbackQueryHandler(user_callbacks))
     app.add_handler(MessageHandler(filters.Document.ALL,admin_document_input))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,admin_text_input))
+    # Dùng Một Router Văn Bản Chung Để Reply Keyboard Hoạt Động Ổn Định Sau Khi Deploy.
+    # Cách Này Không Phụ Thuộc Vào Regex Chính Xác Và Tránh Nút Admin Bị Rơi Vào Handler Nhập Liệu.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, route_text_message))
     app.add_error_handler(error_handler)
-    print("Bot đang chạy...")
+    print("Bot Đang Chạy...")
     app.run_polling(drop_pending_updates=True)
 
 
